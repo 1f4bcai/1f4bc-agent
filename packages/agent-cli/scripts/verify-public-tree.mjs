@@ -46,6 +46,7 @@ async function git(repository, args, options = {}) {
 }
 const REQUIRED_ROOT_PATHS = new Set([
   '.github/workflows/agent-cli-public-ci.yml',
+  '.github/workflows/promote-agent-cli-candidate.yml',
   '.github/workflows/release-agent-cli.yml',
   '.gitignore',
   'package-lock.json',
@@ -73,6 +74,20 @@ const FORBIDDEN_NAMES = /(?:^|\/)(?:\.env(?:\.|$)|\.npmrc$|identity\.json$|wrang
 const PUBLIC_GIT_NAME = '1F4BC Release'
 const PUBLIC_GIT_EMAIL = 'support@1f4bc.com'
 const PUBLIC_RELEASE_MESSAGE_PREFIX = 'release: publish @1f4bcai/agent@'
+const AUTHORITY_BOOTSTRAP_MESSAGE = 'chore: install agent candidate promotion authority\n'
+const AUTHORITY_BOOTSTRAP_TIMESTAMP = String(Date.parse('2026-08-25T23:00:00Z') / 1000)
+const LEGACY_CANONICAL_MAIN = '56d884c752a4ee44eef8de9208858e9ef8fc6423'
+const AUTHORITY_BOOTSTRAP_PATHS = Object.freeze([
+  '.github/workflows/agent-cli-public-ci.yml',
+  '.github/workflows/promote-agent-cli-candidate.yml',
+  'packages/agent-cli/scripts/export-public-source.d.mts',
+  'packages/agent-cli/scripts/export-public-source.mjs',
+  'packages/agent-cli/scripts/promote-release-candidate.d.mts',
+  'packages/agent-cli/scripts/promote-release-candidate.mjs',
+  'packages/agent-cli/scripts/verify-public-tree.mjs',
+  'packages/agent-cli/test/candidate-promotion.test.ts',
+  'packages/agent-cli/test/release-pipeline.test.ts',
+])
 const REPLACEMENT_ROOT_VERSION = '0.1.3'
 const STABLE_SEMVER = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/
 const RETIRED_RELEASE_VERSIONS = new Set(['0.1.0', '0.1.1', '0.1.2'])
@@ -398,6 +413,16 @@ async function publicPackageVersionAt(repository, commit, cache) {
   return version
 }
 
+async function assertAuthorityBootstrapDiff(repository, commit) {
+  const { stdout } = await git(repository, [
+    'diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', commit,
+  ], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+  const changed = stdout.split('\0').filter(Boolean).sort()
+  if (JSON.stringify(changed) !== JSON.stringify([...AUTHORITY_BOOTSTRAP_PATHS].sort())) {
+    throw new Error('public authority-bootstrap commit differs from the exact approved path set')
+  }
+}
+
 async function assertPublicCommitMetadata(repository, commit, text, versionCache) {
   const boundary = text.indexOf('\n\n')
   if (boundary < 0) throw new Error('public commit metadata is malformed')
@@ -429,9 +454,27 @@ async function assertPublicCommitMetadata(repository, commit, text, versionCache
     throw new Error('public commit does not use the organization-controlled Git identity')
   }
   const version = await publicPackageVersionAt(repository, commit, versionCache)
-  if (body !== `${PUBLIC_RELEASE_MESSAGE_PREFIX}${version}\n`) {
+  if (body === `${PUBLIC_RELEASE_MESSAGE_PREFIX}${version}\n`) {
+    return { authorityBootstrap: false, version }
+  }
+  if (
+    body !== AUTHORITY_BOOTSTRAP_MESSAGE ||
+    commit === LEGACY_CANONICAL_MAIN ||
+    parents.length !== 1 ||
+    parents[0] !== `parent ${LEGACY_CANONICAL_MAIN}` ||
+    version !== REPLACEMENT_ROOT_VERSION ||
+    author[1] !== AUTHORITY_BOOTSTRAP_TIMESTAMP
+  ) {
     throw new Error('public release commit message does not match its package tree')
   }
+  const parentVersion = await publicPackageVersionAt(
+    repository, LEGACY_CANONICAL_MAIN, versionCache,
+  )
+  if (parentVersion !== REPLACEMENT_ROOT_VERSION) {
+    throw new Error('public authority bootstrap is not based on the replacement root')
+  }
+  await assertAuthorityBootstrapDiff(repository, commit)
+  return { authorityBootstrap: true, version }
 }
 
 async function assertPublicRefs(repository, versionCache) {
@@ -684,6 +727,7 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
       repository, ['rev-list', '--all'], { encoding: 'utf8' },
     )
     const versionCache = new Map()
+    const authorityBootstrapCommits = new Set()
     const commits = commitListing.split('\n').filter(Boolean)
     for (const commit of commits) {
       const { stdout: treeListing } = await git(
@@ -728,7 +772,8 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
         if (type === 'tag') {
           throw new Error('public repository allows only lightweight release tags')
         }
-        await assertPublicCommitMetadata(repository, hash, text, versionCache)
+        const metadata = await assertPublicCommitMetadata(repository, hash, text, versionCache)
+        if (metadata.authorityBootstrap) authorityBootstrapCommits.add(hash)
         continue
       }
       if (type !== 'blob') continue
@@ -792,32 +837,56 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
       { encoding: 'utf8' },
     )
     let previousVersion
-    for (const commit of chronologicalListing.split('\n').filter(Boolean)) {
+    let previousCommit
+    let authorityBootstrapSeen = false
+    const chronologicalCommits = chronologicalListing.split('\n').filter(Boolean)
+    for (const commit of chronologicalCommits) {
       const version = await publicPackageVersionAt(repository, commit, versionCache)
-      if (
-        previousVersion !== undefined &&
-        compareStableVersions(previousVersion, version) >= 0
+      const authorityBootstrap = authorityBootstrapCommits.has(commit)
+      if (authorityBootstrap) {
+        if (
+          authorityBootstrapSeen ||
+          previousCommit !== LEGACY_CANONICAL_MAIN ||
+          previousVersion !== REPLACEMENT_ROOT_VERSION ||
+          version !== REPLACEMENT_ROOT_VERSION
+        ) {
+          throw new Error('public history authority bootstrap is not the one-time root child')
+        }
+        authorityBootstrapSeen = true
+      } else if (
+        previousVersion !== undefined && compareStableVersions(previousVersion, version) >= 0
       ) {
         throw new Error('public history package versions must increase strictly')
       }
       previousVersion = version
+      previousCommit = commit
+    }
+    if (
+      roots[0] === LEGACY_CANONICAL_MAIN &&
+      chronologicalCommits.length > 1 &&
+      !authorityBootstrapSeen
+    ) {
+      throw new Error('public replacement history is missing the pinned authority bootstrap')
     }
   }
 
   const rootManifest = JSON.parse(await readFile(resolve(repository, 'package.json'), 'utf8'))
-  if (JSON.stringify(rootManifest) !== JSON.stringify(PUBLIC_ROOT_MANIFEST)) {
-    throw new Error('public root manifest differs from the minimal allowlist')
-  }
   const packageManifest = JSON.parse(
     await readFile(resolve(repository, 'packages/agent-cli/package.json'), 'utf8'),
   )
   const lock = JSON.parse(await readFile(resolve(repository, 'package-lock.json'), 'utf8'))
-  assertReleaseVersionAgreement(
+  const currentVersion = assertReleaseVersionAgreement(
     rootManifest,
     packageManifest,
     lock,
     'public current release',
   )
+  if (JSON.stringify(rootManifest) !== JSON.stringify({
+    ...PUBLIC_ROOT_MANIFEST,
+    version: currentVersion,
+  })) {
+    throw new Error('public root manifest differs from the minimal allowlist')
+  }
   const allowedLockPaths = new Set([
     '',
     'packages/agent-cli',
@@ -834,6 +903,7 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
 
   for (const workflow of [
     '.github/workflows/agent-cli-public-ci.yml',
+    '.github/workflows/promote-agent-cli-candidate.yml',
     '.github/workflows/release-agent-cli.yml',
   ]) {
     const text = await readFile(resolve(repository, workflow), 'utf8')

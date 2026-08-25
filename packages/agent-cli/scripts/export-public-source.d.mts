@@ -1,6 +1,6 @@
 export const PUBLIC_ROOT_MANIFEST: Readonly<{
   name: '1f4bc-agent-release-source'
-  version: '0.1.3'
+  version: string
   private: true
   type: 'module'
   workspaces: readonly ['packages/agent-cli']

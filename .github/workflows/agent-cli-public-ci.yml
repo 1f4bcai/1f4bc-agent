@@ -28,10 +28,27 @@ jobs:
           test "${GITHUB_ACTOR_ID}" = "${EXPECTED_RELEASE_APP_ACTOR_ID}"
           test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
 
+      - name: Authorize the release App candidate push
+        if: startsWith(github.ref, 'refs/heads/agent-candidate-')
+        env:
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${EXPECTED_RELEASE_APP_ACTOR}"
+          test -n "${EXPECTED_RELEASE_APP_ACTOR_ID}"
+          test "${GITHUB_EVENT_NAME}" = "push"
+          test "${GITHUB_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
+          test "${GITHUB_ACTOR_ID}" = "${EXPECTED_RELEASE_APP_ACTOR_ID}"
+          test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
+          candidate_ref="${GITHUB_REF#refs/heads/}"
+          [[ "${candidate_ref}" =~ ^agent-candidate-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$ ]]
+          test "${GITHUB_SHA:0:12}" = "${candidate_ref##*-}"
+
       - name: Check out public source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: ${{ github.event_name == 'pull_request' && 1 || 0 }}
+          fetch-depth: ${{ (github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')) && 1 || 0 }}
           persist-credentials: false
 
       - name: Remove checkout's inert worktree config compatibility file
@@ -112,12 +129,21 @@ jobs:
           test "$(node --version)" = "v22.23.2"
           test "$(npm --version)" = "10.9.8"
 
+      - name: Bind the candidate ref to the checked-out package version
+        if: startsWith(github.ref, 'refs/heads/agent-candidate-')
+        run: |
+          set -euo pipefail
+          candidate_ref="${GITHUB_REF#refs/heads/}"
+          candidate_version="${candidate_ref#agent-candidate-}"
+          candidate_version="${candidate_version%-*}"
+          test "$(node -p 'require("./packages/agent-cli/package.json").version')" = "${candidate_version}"
+
       - name: Verify the pull-request candidate snapshot
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')
         run: node packages/agent-cli/scripts/verify-public-tree.mjs --snapshot-only
 
       - name: Verify the minimal public tree and all reachable history
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/agent-candidate-')
         run: node packages/agent-cli/scripts/verify-public-tree.mjs
 
       - name: Install locked dependencies without lifecycle scripts

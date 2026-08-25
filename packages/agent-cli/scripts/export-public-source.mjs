@@ -61,6 +61,8 @@ export const PUBLIC_PACKAGE_FILES = Object.freeze([
   'scripts/generate-release-sbom.d.mts',
   'scripts/generate-release-sbom.mjs',
   'scripts/pack-release.mjs',
+  'scripts/promote-release-candidate.d.mts',
+  'scripts/promote-release-candidate.mjs',
   'scripts/release-preflight.d.mts',
   'scripts/release-preflight.mjs',
   'scripts/validate-release-tarball.d.mts',
@@ -91,6 +93,7 @@ export const PUBLIC_PACKAGE_FILES = Object.freeze([
   'test/mcp.test.ts',
   'test/package.test.ts',
   'test/peer-payments.test.ts',
+  'test/candidate-promotion.test.ts',
   'test/public-export.test.ts',
   'test/release-pipeline.test.ts',
   'test/release-preflight.test.ts',
@@ -101,7 +104,7 @@ export const PUBLIC_PACKAGE_FILES = Object.freeze([
 
 export const PUBLIC_ROOT_MANIFEST = Object.freeze({
   name: '1f4bc-agent-release-source',
-  version: '0.1.3',
+  version: JSON.parse(await readFile(resolve(packageRoot, 'package.json'), 'utf8')).version,
   private: true,
   type: 'module',
   workspaces: [WORKSPACE_PATH],
@@ -285,7 +288,11 @@ export async function exportPublicSource(destination, sourceRoot = repositoryRoo
 
   const sourcePackage = resolve(canonicalSourceRoot, WORKSPACE_PATH)
   await assertExactPackageSource(sourcePackage)
-  const workflows = ['agent-cli-public-ci.yml', 'release-agent-cli.yml']
+  const workflows = [
+    'agent-cli-public-ci.yml',
+    'promote-agent-cli-candidate.yml',
+    'release-agent-cli.yml',
+  ]
   const packageSnapshots = new Map()
   for (const path of PUBLIC_PACKAGE_FILES) {
     packageSnapshots.set(

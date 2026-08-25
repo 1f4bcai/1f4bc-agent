@@ -1,0 +1,146 @@
+name: Promote reviewed agent CLI candidate
+
+on:
+  repository_dispatch:
+    types: [promote-agent-candidate]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-cli-candidate-promotion
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22.23.2"
+
+jobs:
+  authorize-release-app:
+    name: Authorize the release App candidate transaction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require the configured release App actor and account ID
+        env:
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${EXPECTED_RELEASE_APP_ACTOR}"
+          test -n "${EXPECTED_RELEASE_APP_ACTOR_ID}"
+          test "${GITHUB_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
+          test "${GITHUB_ACTOR_ID}" = "${EXPECTED_RELEASE_APP_ACTOR_ID}"
+          test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
+
+  verify-candidate:
+    name: Verify candidate with authority pinned to old main
+    needs: authorize-release-app
+    if: >-
+      vars.RELEASE_APP_ACTOR != '' &&
+      vars.RELEASE_APP_ACTOR_ID != '' &&
+      github.actor == vars.RELEASE_APP_ACTOR &&
+      github.actor_id == vars.RELEASE_APP_ACTOR_ID &&
+      github.triggering_actor == vars.RELEASE_APP_ACTOR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out only the live canonical authority commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pinned Node.js without a package cache
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Verify the exact shallow candidate without write authority
+        env:
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          CANDIDATE_SHA: ${{ github.event.client_payload.candidate_sha }}
+          CANDIDATE_REF: ${{ github.event.client_payload.candidate_ref }}
+        run: >-
+          node packages/agent-cli/scripts/promote-release-candidate.mjs verify
+          --base-sha "${BASE_SHA}"
+          --candidate-sha "${CANDIDATE_SHA}"
+          --candidate-ref "${CANDIDATE_REF}"
+
+  promote-candidate:
+    name: Reverify and atomically promote with App authority
+    needs: [authorize-release-app, verify-candidate]
+    if: >-
+      vars.RELEASE_APP_ACTOR != '' &&
+      vars.RELEASE_APP_ACTOR_ID != '' &&
+      vars.RELEASE_APP_ID != '' &&
+      github.actor == vars.RELEASE_APP_ACTOR &&
+      github.actor_id == vars.RELEASE_APP_ACTOR_ID &&
+      github.triggering_actor == vars.RELEASE_APP_ACTOR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out only the same live canonical authority commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pinned Node.js without a package cache
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Reverify before requesting any write authority
+        env:
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          CANDIDATE_SHA: ${{ github.event.client_payload.candidate_sha }}
+          CANDIDATE_REF: ${{ github.event.client_payload.candidate_ref }}
+        run: >-
+          node packages/agent-cli/scripts/promote-release-candidate.mjs verify
+          --base-sha "${BASE_SHA}"
+          --candidate-sha "${CANDIDATE_SHA}"
+          --candidate-ref "${CANDIDATE_REF}"
+
+      - name: Mint one least-privilege release App installation token
+        id: release-app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: 1f4bcai
+          repositories: 1f4bc-agent
+          permission-contents: write
+
+      - name: Require the minted token to belong to the configured release App
+        env:
+          ACTUAL_RELEASE_APP_SLUG: ${{ steps.release-app-token.outputs.app-slug }}
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          INSTALLATION_ID: ${{ steps.release-app-token.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          test -n "${ACTUAL_RELEASE_APP_SLUG}"
+          test -n "${INSTALLATION_ID}"
+          test "${ACTUAL_RELEASE_APP_SLUG}[bot]" = "${EXPECTED_RELEASE_APP_ACTOR}"
+
+      - name: Reverify and atomically fast-forward main while deleting the candidate
+        env:
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}
+          RELEASE_APP_TOKEN: ${{ steps.release-app-token.outputs.token }}
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          CANDIDATE_SHA: ${{ github.event.client_payload.candidate_sha }}
+          CANDIDATE_REF: ${{ github.event.client_payload.candidate_ref }}
+        run: >-
+          node packages/agent-cli/scripts/promote-release-candidate.mjs promote
+          --base-sha "${BASE_SHA}"
+          --candidate-sha "${CANDIDATE_SHA}"
+          --candidate-ref "${CANDIDATE_REF}"

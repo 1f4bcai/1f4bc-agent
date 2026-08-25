@@ -214,6 +214,43 @@ describe('release dependency closure', () => {
 })
 
 describe('release workflow execution order', () => {
+  it('pins candidate verification to old main and grants only the release App an atomic push', async () => {
+    const workflow = await readFile(
+      new URL('../../../.github/workflows/promote-agent-cli-candidate.yml', import.meta.url),
+      'utf8',
+    )
+    expect(workflow).toContain('types: [promote-agent-candidate]')
+    expect(workflow).not.toContain('workflow_dispatch:')
+    expect(workflow).toContain('cancel-in-progress: false')
+    expectInOrder(workflow, [
+      'authorize-release-app:',
+      'EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}',
+      'EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}',
+      'test "${GITHUB_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"',
+      'test "${GITHUB_ACTOR_ID}" = "${EXPECTED_RELEASE_APP_ACTOR_ID}"',
+      'test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"',
+      'verify-candidate:',
+      'ref: ${{ github.sha }}',
+      'fetch-depth: 1',
+      'persist-credentials: false',
+      'promote-release-candidate.mjs verify',
+      'promote-candidate:',
+      'Reverify before requesting any write authority',
+      'uses: actions/create-github-app-token@',
+      'permission-contents: write',
+      'promote-release-candidate.mjs promote',
+    ])
+    expect(workflow.match(/promote-release-candidate\.mjs verify/g)).toHaveLength(2)
+    expect(workflow.match(/ref: \$\{\{ github\.sha \}\}/g)).toHaveLength(2)
+    expect(workflow.match(/persist-credentials: false/g)).toHaveLength(2)
+    expect(workflow).toContain('RELEASE_APP_PRIVATE_KEY')
+    expect(workflow).toContain('RELEASE_APP_ID')
+    expect(workflow).not.toContain('ref: ${{ github.event.client_payload.candidate_ref }}')
+    expect(workflow).not.toMatch(/uses:\s+[^\s]+@v\d/)
+    expect(workflow).not.toContain('npm ')
+    expect(workflow).not.toContain('id-token: write')
+  })
+
   it('gates all dependencies before the only allowlisted native setup', async () => {
     const workflows = await Promise.all([
       readFile(
@@ -364,7 +401,7 @@ describe('release workflow execution order', () => {
     expect(JSON.parse(manifest).scripts.build).toMatch(/^node scripts\/clean-dist\.mjs &&/)
   })
 
-  it('uses snapshot-only verification exclusively for pull requests', async () => {
+  it('uses snapshot verification only for PRs and authenticated candidate pushes', async () => {
     const [workflow, releaseWorkflow] = await Promise.all([
       readFile(
       new URL('../../../.github/workflows/agent-cli-public-ci.yml', import.meta.url),
@@ -377,7 +414,7 @@ describe('release workflow execution order', () => {
     ])
     expectCheckoutCredentialsDisabled(workflow)
     expect(workflow).toContain(
-      "fetch-depth: ${{ github.event_name == 'pull_request' && 1 || 0 }}",
+      "fetch-depth: ${{ (github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')) && 1 || 0 }}",
     )
     expect(workflow).toContain('repository_dispatch:')
     expect(workflow).toContain('types: [bootstrap-ci]')
@@ -394,8 +431,29 @@ describe('release workflow execution order', () => {
       'test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"',
       '- name: Check out public source',
     ])
-    expect(workflow).toContain("if: github.event_name == 'pull_request'")
-    expect(workflow).toContain("if: github.event_name != 'pull_request'")
+    expect(workflow).toContain("startsWith(github.ref, 'refs/heads/agent-candidate-')")
+    expect(workflow).toContain('- name: Authorize the release App candidate push')
+    expect(workflow).toContain("if: startsWith(github.ref, 'refs/heads/agent-candidate-')")
+    expect(workflow).toContain('test "${GITHUB_SHA:0:12}" = "${candidate_ref##*-}"')
+    expectInOrder(workflow, [
+      '- name: Authorize the release App candidate push',
+      'test "${GITHUB_EVENT_NAME}" = "push"',
+      'test "${GITHUB_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"',
+      'test "${GITHUB_ACTOR_ID}" = "${EXPECTED_RELEASE_APP_ACTOR_ID}"',
+      'test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"',
+      'test "${GITHUB_SHA:0:12}" = "${candidate_ref##*-}"',
+      '- name: Check out public source',
+      '- name: Bind the candidate ref to the checked-out package version',
+      'verify-public-tree.mjs --snapshot-only',
+      'npm ci --ignore-scripts',
+      'npm audit signatures --ignore-scripts',
+      'npm rebuild esbuild --foreground-scripts',
+      'npm test --workspace=@1f4bcai/agent',
+    ])
+    expect(workflow).toContain("if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')")
+    expect(workflow).toContain("if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/agent-candidate-')")
+    expect(workflow).not.toContain('contents: write')
+    expect(workflow).not.toContain('secrets.')
     expect(workflow.match(/verify-public-tree\.mjs --snapshot-only/g)).toHaveLength(1)
     expect(workflow.match(/verify-public-tree\.mjs(?:\s|$)/g)).toHaveLength(2)
     expect(releaseWorkflow).not.toContain('--snapshot-only')
