@@ -1,0 +1,157 @@
+name: Public agent CLI CI
+
+on:
+  push:
+  pull_request:
+  repository_dispatch:
+    types: [bootstrap-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  agent-cli:
+    if: github.repository == '1f4bcai/1f4bc-agent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Authorize the release App bootstrap dispatch
+        if: github.event_name == 'repository_dispatch'
+        env:
+          EXPECTED_RELEASE_APP_ACTOR: ${{ vars.RELEASE_APP_ACTOR }}
+          EXPECTED_RELEASE_APP_ACTOR_ID: ${{ vars.RELEASE_APP_ACTOR_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${EXPECTED_RELEASE_APP_ACTOR}"
+          test -n "${EXPECTED_RELEASE_APP_ACTOR_ID}"
+          test "${GITHUB_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
+          test "${GITHUB_ACTOR_ID}" = "${EXPECTED_RELEASE_APP_ACTOR_ID}"
+          test "${GITHUB_TRIGGERING_ACTOR}" = "${EXPECTED_RELEASE_APP_ACTOR}"
+
+      - name: Check out public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 1 || 0 }}
+          persist-credentials: false
+
+      - name: Remove checkout's inert worktree config compatibility file
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout_worktree_config=".git/config.worktree"
+          test -d .git
+          test ! -L .git
+          test -f .git/config
+          test ! -L .git/config
+          worktree_extension_status=0
+          git config --file .git/config --no-includes --get-all extensions.worktreeConfig \
+            >/dev/null 2>&1 || worktree_extension_status=$?
+          test "${worktree_extension_status}" -eq 1
+          if [[ -e "${checkout_worktree_config}" || -L "${checkout_worktree_config}" ]]; then
+            test ! -L "${checkout_worktree_config}"
+            test -f "${checkout_worktree_config}"
+            test "$(stat -c '%h' "${checkout_worktree_config}")" = "1"
+            worktree_size="$(stat -c '%s' "${checkout_worktree_config}")"
+            [[ "${worktree_size}" =~ ^[0-9]+$ ]]
+            test "${worktree_size}" -le 256
+            if [[ "${worktree_size}" -gt 0 ]]; then
+              worktree_parse_output="$(mktemp)"
+              test -f "${worktree_parse_output}"
+              test ! -L "${worktree_parse_output}"
+              test "$(stat -c '%h' "${worktree_parse_output}")" = "1"
+              trap 'unlink "${worktree_parse_output}"' EXIT
+              worktree_parse_status=0
+              git config --file "${checkout_worktree_config}" --no-includes \
+                --null --list >"${worktree_parse_output}" 2>/dev/null \
+                || worktree_parse_status=$?
+              test "${worktree_parse_status}" -eq 0
+              worktree_entries=()
+              mapfile -d '' -t worktree_entries <"${worktree_parse_output}"
+              unlink "${worktree_parse_output}"
+              trap - EXIT
+              test "${#worktree_entries[@]}" -eq 3
+              seen_core_sparse_checkout=0
+              seen_core_sparse_checkout_cone=0
+              seen_index_sparse=0
+              for worktree_entry in "${worktree_entries[@]}"; do
+                case "${worktree_entry}" in
+                  $'core.sparsecheckout\nfalse')
+                    test "${seen_core_sparse_checkout}" -eq 0
+                    seen_core_sparse_checkout=1
+                    ;;
+                  $'core.sparsecheckoutcone\nfalse')
+                    test "${seen_core_sparse_checkout_cone}" -eq 0
+                    seen_core_sparse_checkout_cone=1
+                    ;;
+                  $'index.sparse\nfalse')
+                    test "${seen_index_sparse}" -eq 0
+                    seen_index_sparse=1
+                    ;;
+                  *)
+                    exit 1
+                    ;;
+                esac
+              done
+              test "${seen_core_sparse_checkout}" -eq 1
+              test "${seen_core_sparse_checkout_cone}" -eq 1
+              test "${seen_index_sparse}" -eq 1
+            fi
+            unlink "${checkout_worktree_config}"
+          fi
+          test ! -e "${checkout_worktree_config}"
+          test ! -L "${checkout_worktree_config}"
+
+      - name: Set up pinned Node.js without a package cache
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+
+      - name: Verify pinned toolchain
+        run: |
+          test "$(node --version)" = "v22.23.2"
+          test "$(npm --version)" = "10.9.8"
+
+      - name: Verify the pull-request candidate snapshot
+        if: github.event_name == 'pull_request'
+        run: node packages/agent-cli/scripts/verify-public-tree.mjs --snapshot-only
+
+      - name: Verify the minimal public tree and all reachable history
+        if: github.event_name != 'pull_request'
+        run: node packages/agent-cli/scripts/verify-public-tree.mjs
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Gate advisories, registry signatures, provenance, and the runtime closure
+        env:
+          MIN_DEPENDENCY_AGE_HOURS: "72"
+        run: |
+          set -euo pipefail
+          npm audit --workspace=@1f4bcai/agent --audit-level=low --ignore-scripts
+          npm audit signatures --ignore-scripts
+          node packages/agent-cli/scripts/check-release-dependencies.mjs
+
+      - name: Run the one verified native setup script
+        run: npm rebuild esbuild --foreground-scripts
+
+      - name: Typecheck, clean-build, and test
+        run: |
+          set -euo pipefail
+          npm run typecheck --workspace=@1f4bcai/agent
+          npm run build --workspace=@1f4bcai/agent
+          npm test --workspace=@1f4bcai/agent
+
+      - name: Switch to and smoke-test the exact supported Node floor
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20.3.0
+          package-manager-cache: false
+
+      - name: Exercise the built artifact on Node 20.3.0
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v20.3.0"
+          node -e "if (typeof AbortSignal.any !== 'function') process.exit(1)"
+          node packages/agent-cli/dist/index.js --help >/dev/null
+          node -e "Promise.all(['index','api','mcp','mcp-payments','peer-payments'].map((name) => import('./packages/agent-cli/dist/' + name + '.js')))"
