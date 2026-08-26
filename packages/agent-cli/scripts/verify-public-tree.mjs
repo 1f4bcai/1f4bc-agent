@@ -77,6 +77,9 @@ const PUBLIC_RELEASE_MESSAGE_PREFIX = 'release: publish @1f4bcai/agent@'
 const AUTHORITY_BOOTSTRAP_MESSAGE = 'chore: install agent candidate promotion authority\n'
 const AUTHORITY_BOOTSTRAP_TIMESTAMP = String(Date.parse('2026-08-25T23:00:00Z') / 1000)
 const LEGACY_CANONICAL_MAIN = '56d884c752a4ee44eef8de9208858e9ef8fc6423'
+const PUBLIC_CI_AUTHORITY_REPAIR_MESSAGE = 'chore: repair agent candidate CI authority\n'
+const PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP = String(Date.parse('2026-08-26T17:30:00Z') / 1000)
+const PUBLIC_CI_AUTHORITY_REPAIR_PARENT = '9f16eb8a351fd39a1e6f79a6d130b96c0161dd13'
 const AUTHORITY_BOOTSTRAP_PATHS = Object.freeze([
   '.github/workflows/agent-cli-public-ci.yml',
   '.github/workflows/promote-agent-cli-candidate.yml',
@@ -86,6 +89,13 @@ const AUTHORITY_BOOTSTRAP_PATHS = Object.freeze([
   'packages/agent-cli/scripts/promote-release-candidate.mjs',
   'packages/agent-cli/scripts/verify-public-tree.mjs',
   'packages/agent-cli/test/candidate-promotion.test.ts',
+  'packages/agent-cli/test/release-pipeline.test.ts',
+])
+const PUBLIC_CI_AUTHORITY_REPAIR_PATHS = Object.freeze([
+  '.github/workflows/agent-cli-public-ci.yml',
+  'packages/agent-cli/scripts/verify-public-tree.d.mts',
+  'packages/agent-cli/scripts/verify-public-tree.mjs',
+  'packages/agent-cli/test/public-export.test.ts',
   'packages/agent-cli/test/release-pipeline.test.ts',
 ])
 const REPLACEMENT_ROOT_VERSION = '0.1.3'
@@ -423,6 +433,32 @@ async function assertAuthorityBootstrapDiff(repository, commit) {
   }
 }
 
+async function assertPublicCiAuthorityRepairDiff(repository, commit) {
+  const { stdout } = await git(repository, [
+    'diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', commit,
+  ], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+  const changed = stdout.split('\0').filter(Boolean).sort()
+  if (JSON.stringify(changed) !== JSON.stringify([...PUBLIC_CI_AUTHORITY_REPAIR_PATHS].sort())) {
+    throw new Error('public CI authority-repair commit differs from the exact approved path set')
+  }
+}
+
+export function assertPublicCiAuthorityRepairPlacement({
+  commit,
+  parent,
+  version,
+  authorTimestamp,
+}) {
+  if (
+    commit === PUBLIC_CI_AUTHORITY_REPAIR_PARENT ||
+    parent !== PUBLIC_CI_AUTHORITY_REPAIR_PARENT ||
+    version !== REPLACEMENT_ROOT_VERSION ||
+    authorTimestamp !== PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP
+  ) {
+    throw new Error('public CI authority-repair commit is not the exact pinned history extension')
+  }
+}
+
 async function assertPublicCommitMetadata(repository, commit, text, versionCache) {
   const boundary = text.indexOf('\n\n')
   if (boundary < 0) throw new Error('public commit metadata is malformed')
@@ -455,7 +491,26 @@ async function assertPublicCommitMetadata(repository, commit, text, versionCache
   }
   const version = await publicPackageVersionAt(repository, commit, versionCache)
   if (body === `${PUBLIC_RELEASE_MESSAGE_PREFIX}${version}\n`) {
-    return { authorityBootstrap: false, version }
+    return { authorityBootstrap: false, authorityRepair: false, version }
+  }
+  if (body === PUBLIC_CI_AUTHORITY_REPAIR_MESSAGE) {
+    if (parents.length !== 1) {
+      throw new Error('public CI authority-repair commit is not the exact pinned history extension')
+    }
+    assertPublicCiAuthorityRepairPlacement({
+      commit,
+      parent: parents[0].slice('parent '.length),
+      version,
+      authorTimestamp: author[1],
+    })
+    const parentVersion = await publicPackageVersionAt(
+      repository, PUBLIC_CI_AUTHORITY_REPAIR_PARENT, versionCache,
+    )
+    if (parentVersion !== REPLACEMENT_ROOT_VERSION) {
+      throw new Error('public CI authority repair is not based on the pinned authority main')
+    }
+    await assertPublicCiAuthorityRepairDiff(repository, commit)
+    return { authorityBootstrap: false, authorityRepair: true, version }
   }
   if (
     body !== AUTHORITY_BOOTSTRAP_MESSAGE ||
@@ -474,7 +529,7 @@ async function assertPublicCommitMetadata(repository, commit, text, versionCache
     throw new Error('public authority bootstrap is not based on the replacement root')
   }
   await assertAuthorityBootstrapDiff(repository, commit)
-  return { authorityBootstrap: true, version }
+  return { authorityBootstrap: true, authorityRepair: false, version }
 }
 
 async function assertPublicRefs(repository, versionCache) {
@@ -728,6 +783,7 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
     )
     const versionCache = new Map()
     const authorityBootstrapCommits = new Set()
+    const authorityRepairCommits = new Set()
     const commits = commitListing.split('\n').filter(Boolean)
     for (const commit of commits) {
       const { stdout: treeListing } = await git(
@@ -774,6 +830,7 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
         }
         const metadata = await assertPublicCommitMetadata(repository, hash, text, versionCache)
         if (metadata.authorityBootstrap) authorityBootstrapCommits.add(hash)
+        if (metadata.authorityRepair) authorityRepairCommits.add(hash)
         continue
       }
       if (type !== 'blob') continue
@@ -839,10 +896,12 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
     let previousVersion
     let previousCommit
     let authorityBootstrapSeen = false
+    let authorityRepairSeen = false
     const chronologicalCommits = chronologicalListing.split('\n').filter(Boolean)
     for (const commit of chronologicalCommits) {
       const version = await publicPackageVersionAt(repository, commit, versionCache)
       const authorityBootstrap = authorityBootstrapCommits.has(commit)
+      const authorityRepair = authorityRepairCommits.has(commit)
       if (authorityBootstrap) {
         if (
           authorityBootstrapSeen ||
@@ -853,6 +912,17 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
           throw new Error('public history authority bootstrap is not the one-time root child')
         }
         authorityBootstrapSeen = true
+      } else if (authorityRepair) {
+        if (
+          authorityRepairSeen ||
+          !authorityBootstrapSeen ||
+          previousCommit !== PUBLIC_CI_AUTHORITY_REPAIR_PARENT ||
+          previousVersion !== REPLACEMENT_ROOT_VERSION ||
+          version !== REPLACEMENT_ROOT_VERSION
+        ) {
+          throw new Error('public history CI authority repair is not the one-time pinned extension')
+        }
+        authorityRepairSeen = true
       } else if (
         previousVersion !== undefined && compareStableVersions(previousVersion, version) >= 0
       ) {
@@ -867,6 +937,13 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
       !authorityBootstrapSeen
     ) {
       throw new Error('public replacement history is missing the pinned authority bootstrap')
+    }
+    if (
+      chronologicalCommits.includes(PUBLIC_CI_AUTHORITY_REPAIR_PARENT) &&
+      chronologicalCommits.at(-1) !== PUBLIC_CI_AUTHORITY_REPAIR_PARENT &&
+      !authorityRepairSeen
+    ) {
+      throw new Error('public replacement history is missing the pinned CI authority repair')
     }
   }
 

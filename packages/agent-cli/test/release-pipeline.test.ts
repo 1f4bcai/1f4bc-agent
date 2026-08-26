@@ -416,6 +416,25 @@ describe('release workflow execution order', () => {
     expect(workflow).toContain(
       "fetch-depth: ${{ (github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')) && 1 || 0 }}",
     )
+    expectInOrder(workflow, [
+      '- name: Check out public source',
+      'ref: ${{ github.sha }}',
+      "fetch-depth: ${{ (github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')) && 1 || 0 }}",
+      'persist-credentials: false',
+      '- name: Remove checkout\'s inert worktree config compatibility file',
+      '- name: Prove the candidate checkout is exact, detached, and tracking-free',
+      'test "$(git rev-parse --verify HEAD^{commit})" = "${GITHUB_SHA}"',
+      'test "${symbolic_head_status}" -eq 1',
+      'test "${candidate_remote_status}" -eq 1',
+      'test "${candidate_merge_status}" -eq 1',
+      'test "${candidate_config_status}" -eq 1',
+      'test ! -s "${candidate_config_output}"',
+    ])
+    expect(workflow.match(/uses: actions\/checkout@/g)).toHaveLength(1)
+    expect(workflow.match(/ref: \$\{\{ github\.sha \}\}/g)).toHaveLength(1)
+    expect(workflow.match(/persist-credentials: false/g)).toHaveLength(1)
+    expect(workflow).not.toContain('git config --global')
+    expect(workflow).not.toContain('git config --unset')
     expect(workflow).toContain('repository_dispatch:')
     expect(workflow).toContain('types: [bootstrap-ci]')
     expect(workflow).not.toContain('workflow_dispatch:')

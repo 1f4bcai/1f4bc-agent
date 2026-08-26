@@ -48,6 +48,10 @@ jobs:
       - name: Check out public source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The pinned action classifies a full SHA as SHA-only, so every event
+          # is bound to the event commit and checked out detached. Candidate and
+          # PR snapshots stay shallow; canonical events still fetch all history.
+          ref: ${{ github.sha }}
           fetch-depth: ${{ (github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/agent-candidate-')) && 1 || 0 }}
           persist-credentials: false
 
@@ -117,6 +121,57 @@ jobs:
           fi
           test ! -e "${checkout_worktree_config}"
           test ! -L "${checkout_worktree_config}"
+
+      - name: Prove the candidate checkout is exact, detached, and tracking-free
+        if: startsWith(github.ref, 'refs/heads/agent-candidate-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_EVENT_NAME}" = "push"
+          candidate_ref="${GITHUB_REF#refs/heads/}"
+          test "${GITHUB_REF}" = "refs/heads/${candidate_ref}"
+          [[ "${candidate_ref}" =~ ^agent-candidate-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$ ]]
+          test "${GITHUB_SHA:0:12}" = "${candidate_ref##*-}"
+          test "$(git rev-parse --verify HEAD^{commit})" = "${GITHUB_SHA}"
+
+          symbolic_head_status=0
+          git symbolic-ref -q HEAD >/dev/null 2>&1 || symbolic_head_status=$?
+          test "${symbolic_head_status}" -eq 1
+
+          test -d .git
+          test ! -L .git
+          test -f .git/config
+          test ! -L .git/config
+          test "$(stat -c '%h' .git/config)" = "1"
+          config_size="$(stat -c '%s' .git/config)"
+          [[ "${config_size}" =~ ^[0-9]+$ ]]
+          test "${config_size}" -le 1048576
+
+          candidate_remote_status=0
+          git config --file .git/config --no-includes \
+            --get-all "branch.${candidate_ref}.remote" >/dev/null 2>&1 \
+            || candidate_remote_status=$?
+          test "${candidate_remote_status}" -eq 1
+          candidate_merge_status=0
+          git config --file .git/config --no-includes \
+            --get-all "branch.${candidate_ref}.merge" >/dev/null 2>&1 \
+            || candidate_merge_status=$?
+          test "${candidate_merge_status}" -eq 1
+
+          escaped_candidate_ref="${candidate_ref//./\\.}"
+          candidate_config_output="$(mktemp)"
+          test -f "${candidate_config_output}"
+          test ! -L "${candidate_config_output}"
+          test "$(stat -c '%h' "${candidate_config_output}")" = "1"
+          trap 'unlink "${candidate_config_output}"' EXIT
+          candidate_config_status=0
+          git config --file .git/config --no-includes --get-regexp \
+            "^branch\\.${escaped_candidate_ref}\\." >"${candidate_config_output}" 2>/dev/null \
+            || candidate_config_status=$?
+          test "${candidate_config_status}" -eq 1
+          test ! -s "${candidate_config_output}"
+          unlink "${candidate_config_output}"
+          trap - EXIT
 
       - name: Set up pinned Node.js without a package cache
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

@@ -16,11 +16,18 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, posix } from 'node:path'
 import { promisify } from 'node:util'
+import { init, parse } from 'es-module-lexer'
 import { afterEach, expect, it } from 'vitest'
-import { exportPublicSource } from '../scripts/export-public-source.mjs'
-import { verifyPublicTree } from '../scripts/verify-public-tree.mjs'
+import {
+  PUBLIC_PACKAGE_FILES,
+  exportPublicSource,
+} from '../scripts/export-public-source.mjs'
+import {
+  assertPublicCiAuthorityRepairPlacement,
+  verifyPublicTree,
+} from '../scripts/verify-public-tree.mjs'
 
 const execFileAsync = promisify(execFile)
 const cleanup: string[] = []
@@ -32,11 +39,36 @@ const CLEANUP_OPTIONS = Object.freeze({
 })
 const PUBLIC_GIT_NAME = '1F4BC Release'
 const PUBLIC_GIT_EMAIL = 'support@1f4bc.com'
-const PUBLIC_GIT_MESSAGE = 'release: publish @1f4bcai/agent@0.1.3'
-const PUBLIC_GIT_DATE = '2026-08-25T00:00:00Z'
+const REPLACEMENT_ROOT_VERSION = '0.1.3'
 
-async function commitRelease(destination: string) {
-  await execFileAsync('git', ['commit', '-m', PUBLIC_GIT_MESSAGE], {
+function nextPatchVersion(version: string): string {
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(version)
+  if (!match) throw new Error('checked-out package version is not canonical SemVer')
+  return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`
+}
+
+const CHECKED_OUT_VERSION = String(JSON.parse(
+  await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+).version)
+nextPatchVersion(CHECKED_OUT_VERSION) // validate before using it in Git refs and messages
+// The public 0.1.3 authority repair intentionally copies these exact test bytes
+// without changing any package version. Build the history fixture at the checked-
+// out version normally, but synthesize the next patch when that version is also
+// the immutable 0.1.3 replacement root so the child release cannot be a no-op.
+const CURRENT_VERSION = CHECKED_OUT_VERSION === REPLACEMENT_ROOT_VERSION
+  ? nextPatchVersion(REPLACEMENT_ROOT_VERSION)
+  : CHECKED_OUT_VERSION
+const PUBLIC_GIT_MESSAGE = `release: publish @1f4bcai/agent@${CURRENT_VERSION}`
+const PUBLIC_GIT_DATE = '2026-08-25T00:00:00Z'
+const PUBLIC_CI_AUTHORITY_REPAIR_PARENT = '9f16eb8a351fd39a1e6f79a6d130b96c0161dd13'
+const PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP = String(Date.parse('2026-08-26T17:30:00Z') / 1000)
+
+function releaseMessage(version: string) {
+  return `release: publish @1f4bcai/agent@${version}`
+}
+
+async function commitRelease(destination: string, version = CURRENT_VERSION) {
+  await execFileAsync('git', ['commit', '-m', releaseMessage(version)], {
     cwd: destination,
     env: {
       ...process.env,
@@ -50,7 +82,7 @@ async function installRawCommit(
   destination: string,
   label: string,
   metadataHeaders: string[],
-  message = PUBLIC_GIT_MESSAGE,
+  message = releaseMessage(CURRENT_VERSION),
 ) {
   const [{ stdout: tree }, { stdout: parent }] = await Promise.all([
     execFileAsync('git', ['rev-parse', 'HEAD^{tree}'], {
@@ -91,14 +123,89 @@ async function exportedRepository() {
   cleanup.push(parent)
   const destination = join(parent, 'public')
   await exportPublicSource(destination)
+  const versionedPaths = [
+    'package.json',
+    'packages/agent-cli/package.json',
+    'package-lock.json',
+  ]
+  const exportedVersionedFiles = new Map(
+    await Promise.all(versionedPaths.map(async (path) => [
+      path,
+      await readFile(join(destination, path), 'utf8'),
+    ] as const)),
+  )
+  for (const [path, contents] of exportedVersionedFiles) {
+    const document = JSON.parse(contents)
+    expect(document.version, `${path} must match the checked-out package version`)
+      .toBe(CHECKED_OUT_VERSION)
+    if (path === 'package-lock.json') {
+      expect(document.packages[''].version).toBe(CHECKED_OUT_VERSION)
+      expect(document.packages['packages/agent-cli'].version).toBe(CHECKED_OUT_VERSION)
+    }
+  }
+  const currentVersionedFiles = new Map(
+    [...exportedVersionedFiles].map(([path, contents]) => {
+      if (CURRENT_VERSION === CHECKED_OUT_VERSION) return [path, contents]
+      const document = JSON.parse(contents)
+      document.version = CURRENT_VERSION
+      if (path === 'package-lock.json') {
+        document.packages[''].version = CURRENT_VERSION
+        document.packages['packages/agent-cli'].version = CURRENT_VERSION
+      }
+      return [path, `${JSON.stringify(document, null, 2)}\n`]
+    }),
+  )
+  for (const path of versionedPaths) {
+    const document = JSON.parse(currentVersionedFiles.get(path)!)
+    document.version = REPLACEMENT_ROOT_VERSION
+    if (path === 'package-lock.json') {
+      document.packages[''].version = REPLACEMENT_ROOT_VERSION
+      document.packages['packages/agent-cli'].version = REPLACEMENT_ROOT_VERSION
+    }
+    await writeFile(join(destination, path), `${JSON.stringify(document, null, 2)}\n`)
+  }
   await execFileAsync('git', ['init', '-b', 'main'], { cwd: destination })
   await execFileAsync('git', ['config', 'maintenance.auto', 'false'], { cwd: destination })
   await execFileAsync('git', ['config', 'gc.auto', '0'], { cwd: destination })
   await execFileAsync('git', ['config', 'user.name', PUBLIC_GIT_NAME], { cwd: destination })
   await execFileAsync('git', ['config', 'user.email', PUBLIC_GIT_EMAIL], { cwd: destination })
   await execFileAsync('git', ['add', '--all'], { cwd: destination })
+  await commitRelease(destination, REPLACEMENT_ROOT_VERSION)
+  for (const [path, contents] of currentVersionedFiles) {
+    await writeFile(join(destination, path), contents)
+  }
+  await execFileAsync('git', ['add', '--all'], { cwd: destination })
   await commitRelease(destination)
   return destination
+}
+
+function staticModuleResolutionCandidates(target: string): string[] {
+  const extension = posix.extname(target)
+  if (extension === '.js') return [target, `${target.slice(0, -3)}.ts`]
+  if (extension) return [target]
+  return [target, `${target}.ts`, `${target}.mjs`, posix.join(target, 'index.ts')]
+}
+
+async function assertSelfContainedStaticModuleGraph(
+  packageSnapshots: ReadonlyMap<string, Uint8Array>,
+): Promise<void> {
+  await init
+  for (const [relativeFile, bytes] of packageSnapshots) {
+    if (!/\.(?:m?[jt]s)$/.test(relativeFile)) continue
+    const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    const [imports] = parse(source)
+    for (const imported of imports) {
+      const specifier = imported.n
+      if (typeof specifier !== 'string' || !specifier.startsWith('.')) continue
+      const target = posix.normalize(posix.join(posix.dirname(relativeFile), specifier))
+      if (target === '..' || target.startsWith('../') || posix.isAbsolute(target)) {
+        throw new Error(`public source import escapes the package: ${relativeFile}`)
+      }
+      if (!staticModuleResolutionCandidates(target).some((path) => packageSnapshots.has(path))) {
+        throw new Error(`public source import targets a missing module: ${relativeFile}`)
+      }
+    }
+  }
 }
 
 it('exports only a fresh-history minimal CLI source and locked dependency closure', async () => {
@@ -109,7 +216,7 @@ it('exports only a fresh-history minimal CLI source and locked dependency closur
   expect(result.lockedPackages).toBeLessThan(180)
   expect(JSON.parse(await readFile(join(destination, 'package.json'), 'utf8'))).toEqual({
     name: '1f4bc-agent-release-source',
-    version: '0.1.3',
+    version: CURRENT_VERSION,
     private: true,
     type: 'module',
     workspaces: ['packages/agent-cli'],
@@ -118,6 +225,30 @@ it('exports only a fresh-history minimal CLI source and locked dependency closur
     code: 'ENOENT',
   })
 }, 20_000)
+
+it('exports a self-contained static module graph', async () => {
+  const destination = await exportedRepository()
+  const packageRoot = join(destination, 'packages/agent-cli')
+  const snapshots = new Map(await Promise.all(PUBLIC_PACKAGE_FILES.map(async (path) => [
+    path,
+    await readFile(join(packageRoot, path)),
+  ] as const)))
+  await expect(assertSelfContainedStaticModuleGraph(snapshots)).resolves.toBeUndefined()
+}, 20_000)
+
+it('rejects escaping and missing modules in the exported static import graph', async () => {
+  const bytes = (source: string) => new TextEncoder().encode(source)
+  await expect(assertSelfContainedStaticModuleGraph(new Map([
+    ['test/example.test.ts', bytes("import '../../../src/private.js'")],
+  ]))).rejects.toThrow(/escapes the package/i)
+  await expect(assertSelfContainedStaticModuleGraph(new Map([
+    ['test/example.test.ts', bytes("import '../src/missing.js'")],
+  ]))).rejects.toThrow(/missing module/i)
+  await expect(assertSelfContainedStaticModuleGraph(new Map([
+    ['test/example.test.ts', bytes("import '../src/api.js'")],
+    ['src/api.ts', bytes('export {}')],
+  ]))).resolves.toBeUndefined()
+})
 
 it('disables background Git maintenance in disposable export repositories', async () => {
   const destination = await exportedRepository()
@@ -169,10 +300,10 @@ it('requires the replacement history root to be exactly version 0.1.3', async ()
   await rm(join(destination, '.git'), CLEANUP_OPTIONS)
   for (const path of versionedPaths) {
     const document = JSON.parse(originals.get(path)!)
-    document.version = '0.1.4'
+    document.version = CURRENT_VERSION
     if (path === 'package-lock.json') {
-      document.packages[''].version = '0.1.4'
-      document.packages['packages/agent-cli'].version = '0.1.4'
+      document.packages[''].version = CURRENT_VERSION
+      document.packages['packages/agent-cli'].version = CURRENT_VERSION
     }
     await writeFile(join(destination, path), `${JSON.stringify(document, null, 2)}\n`)
   }
@@ -184,7 +315,7 @@ it('requires the replacement history root to be exactly version 0.1.3', async ()
   await execFileAsync('git', ['config', 'user.email', PUBLIC_GIT_EMAIL], { cwd: destination })
   await execFileAsync('git', ['add', '--all'], { cwd: destination })
   await execFileAsync(
-    'git', ['commit', '-m', 'release: publish @1f4bcai/agent@0.1.4'],
+    'git', ['commit', '-m', releaseMessage(CURRENT_VERSION)],
     {
       cwd: destination,
       env: {
@@ -194,12 +325,6 @@ it('requires the replacement history root to be exactly version 0.1.3', async ()
       },
     },
   )
-
-  for (const [path, contents] of originals) {
-    await writeFile(join(destination, path), contents)
-  }
-  await execFileAsync('git', ['add', '--all'], { cwd: destination })
-  await commitRelease(destination)
 
   await expect(verifyPublicTree(destination)).rejects.toThrow(
     /replacement history root.*0\.1\.3/i,
@@ -800,11 +925,13 @@ it('ignores inherited Git metadata overrides and still finds unsafe target histo
 
 it('rejects shallow and legacy-grafted repository history', async () => {
   const shallow = await exportedRepository()
-  const { stdout: shallowHead } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
-    cwd: shallow,
-    encoding: 'utf8',
-  })
-  await writeFile(join(shallow, '.git', 'shallow'), shallowHead)
+  const { stdout: shallowBoundary } = await execFileAsync(
+    'git', ['rev-list', '--max-parents=0', 'HEAD'], {
+      cwd: shallow,
+      encoding: 'utf8',
+    },
+  )
+  await writeFile(join(shallow, '.git', 'shallow'), shallowBoundary)
   await expect(
     verifyPublicTree(shallow, { mode: 'snapshot-only' }),
   ).resolves.toMatchObject({ trackedFiles: expect.any(Number) })
@@ -1148,6 +1275,25 @@ it('rejects arbitrary public commit messages', async () => {
   expect((error as Error).message).not.toContain(injectedMessage)
 })
 
+it('recognizes only the exact pinned one-time public CI authority-repair placement', () => {
+  const valid = {
+    commit: 'a'.repeat(40),
+    parent: PUBLIC_CI_AUTHORITY_REPAIR_PARENT,
+    version: REPLACEMENT_ROOT_VERSION,
+    authorTimestamp: PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP,
+  }
+  expect(() => assertPublicCiAuthorityRepairPlacement(valid)).not.toThrow()
+  for (const [field, value] of [
+    ['commit', PUBLIC_CI_AUTHORITY_REPAIR_PARENT],
+    ['parent', 'b'.repeat(40)],
+    ['version', CURRENT_VERSION],
+    ['authorTimestamp', String(Number(PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP) + 1)],
+  ] as const) {
+    expect(() => assertPublicCiAuthorityRepairPlacement({ ...valid, [field]: value }))
+      .toThrow(/exact pinned history extension/i)
+  }
+})
+
 it('rejects a release message whose version differs from its tree', async () => {
   const destination = await exportedRepository()
   await execFileAsync(
@@ -1205,7 +1351,7 @@ it('rejects a credential-free optional raw commit header', async () => {
 
 it('accepts only the current lightweight release tag', async () => {
   const destination = await exportedRepository()
-  await execFileAsync('git', ['tag', 'agent-v0.1.3'], { cwd: destination })
+  await execFileAsync('git', ['tag', `agent-v${CURRENT_VERSION}`], { cwd: destination })
   await expect(verifyPublicTree(destination)).resolves.toMatchObject({
     trackedFiles: expect.any(Number),
   })
@@ -1229,7 +1375,7 @@ it('rejects annotated release tags', async () => {
   const annotated = await exportedRepository()
   await execFileAsync(
     'git',
-    ['tag', '-a', 'agent-v0.1.3', '-m', 'release: publish @1f4bcai/agent@0.1.3'],
+    ['tag', '-a', `agent-v${CURRENT_VERSION}`, '-m', releaseMessage(CURRENT_VERSION)],
     { cwd: annotated },
   )
   await expect(verifyPublicTree(annotated)).rejects.toThrow(/lightweight release tags/i)
@@ -1251,7 +1397,7 @@ it('accepts the canonical optional origin refs', async () => {
 
 it('requires a canonical main ref even when a valid-looking release tag exists', async () => {
   const destination = await exportedRepository()
-  await execFileAsync('git', ['tag', 'agent-v0.1.3'], { cwd: destination })
+  await execFileAsync('git', ['tag', `agent-v${CURRENT_VERSION}`], { cwd: destination })
   await execFileAsync('git', ['switch', '--detach'], { cwd: destination })
   await execFileAsync('git', ['update-ref', '-d', 'refs/heads/main'], { cwd: destination })
   await expect(verifyPublicTree(destination)).rejects.toThrow(/canonical main ref/i)
@@ -1297,7 +1443,7 @@ it('rejects a valid-looking release tag disconnected from canonical main', async
     },
   )
   await execFileAsync(
-    'git', ['update-ref', 'refs/tags/agent-v0.1.3', disconnectedCommit.trim()],
+    'git', ['update-ref', `refs/tags/agent-v${CURRENT_VERSION}`, disconnectedCommit.trim()],
     { cwd: destination },
   )
   await expect(verifyPublicTree(destination)).rejects.toThrow(/release tag.*canonical main/i)

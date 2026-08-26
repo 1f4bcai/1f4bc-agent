@@ -3,6 +3,12 @@ export type PublicTreeVerificationMode = 'full' | 'snapshot-only'
 export interface PublicTreeVerificationOptions {
   mode?: PublicTreeVerificationMode
 }
+export function assertPublicCiAuthorityRepairPlacement(input: {
+  commit: string
+  parent: string
+  version: string
+  authorTimestamp: string
+}): void
 export function verifyPublicTree(root?: string, options?: PublicTreeVerificationOptions): Promise<{
   trackedFiles: number
   lockedPackages: number
