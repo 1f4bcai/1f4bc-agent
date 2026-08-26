@@ -74,6 +74,7 @@ type PromotionFixture = {
   base: string
   candidate: string
   candidateRef: string
+  releaseCommit: string
   remote: string
   source: string
 }
@@ -81,6 +82,7 @@ type PromotionFixture = {
 async function promotionFixture(options: {
   alterAuthority?: boolean
   extraParent?: boolean
+  sameVersionGovernance?: boolean
 } = {}): Promise<PromotionFixture> {
   const parent = await mkdtemp(join(tmpdir(), '1f4bc-candidate-promotion-'))
   cleanup.push(parent)
@@ -91,15 +93,27 @@ async function promotionFixture(options: {
   await setExportVersion(source, '0.1.3')
   await git(source, ['init', '-b', 'main'])
   await configurePublicGit(source)
-  const base = await commit(
+  const releaseCommit = await commit(
     source,
     'release: publish @1f4bcai/agent@0.1.3',
     '2026-08-25T00:00:00Z',
   )
   await git(parent, ['init', '--bare', remote])
   await git(source, ['remote', 'add', 'origin', remote])
-  await git(source, ['tag', 'agent-v0.1.3', base])
+  await git(source, ['tag', 'agent-v0.1.3', releaseCommit])
   await git(source, ['push', 'origin', 'main:main', 'agent-v0.1.3'])
+  let base = releaseCommit
+  if (options.sameVersionGovernance) {
+    await writeFile(join(source, 'packages/agent-cli/README.md'), `${
+      await readFile(join(source, 'packages/agent-cli/README.md'), 'utf8')
+    }\nReviewed same-version governance fixture.\n`)
+    base = await commit(
+      source,
+      'chore: reviewed same-version governance fixture',
+      '2026-08-25T00:00:30Z',
+    )
+    await git(source, ['push', 'origin', 'main:main'])
+  }
   await git(parent, ['clone', '--branch', 'main', remote, authority])
   await configurePublicGit(authority)
 
@@ -121,7 +135,7 @@ async function promotionFixture(options: {
   )
   const candidateRef = `agent-candidate-0.1.4-${candidate.slice(0, 12)}`
   await git(source, ['push', 'origin', `HEAD:refs/heads/${candidateRef}`])
-  return { authority, base, candidate, candidateRef, remote, source }
+  return { authority, base, candidate, candidateRef, releaseCommit, remote, source }
 }
 
 function options(fixture: PromotionFixture) {
@@ -249,6 +263,107 @@ describe('App-only public release candidate promotion', () => {
     expect(refs).not.toContain(fixture.candidateRef)
   }, 30_000)
 
+  it('accepts the immutable base-version tag at a verified ancestor of same-version governance', async () => {
+    const fixture = await promotionFixture({ sameVersionGovernance: true })
+    let historyChecked = false
+    const result = await promoteReleaseCandidate({
+      ...options(fixture),
+      publicHistoryCheck: async (repository) => {
+        historyChecked = true
+        expect((await git(repository, ['rev-parse', '--is-shallow-repository'])).stdout.trim())
+          .toBe('false')
+        await git(repository, [
+          'merge-base', '--is-ancestor', fixture.releaseCommit, fixture.base,
+        ])
+      },
+    })
+    expect(historyChecked).toBe(true)
+    expect(result).toMatchObject({
+      baseCommit: fixture.base,
+      candidateCommit: fixture.candidate,
+      promoted: true,
+      shallowCandidate: true,
+    })
+    expect((await git(fixture.remote, ['rev-parse', 'refs/tags/agent-v0.1.3'])).stdout.trim())
+      .toBe(fixture.releaseCommit)
+  }, 30_000)
+
+  it('rejects a base-version tag that is not an ancestor of canonical main', async () => {
+    const fixture = await promotionFixture({ sameVersionGovernance: true })
+    const tree = (await git(fixture.source, [
+      'rev-parse', `${fixture.releaseCommit}^{tree}`,
+    ])).stdout.trim()
+    const orphan = (await git(fixture.source, ['commit-tree', tree, '-m',
+      'release: publish @1f4bcai/agent@0.1.3'], {
+      GIT_AUTHOR_DATE: '2026-08-25T00:00:15Z',
+      GIT_COMMITTER_DATE: '2026-08-25T00:00:15Z',
+    })).stdout.trim()
+    await git(fixture.source, [
+      'push', '--force', 'origin', `${orphan}:refs/tags/agent-v0.1.3`,
+    ])
+    await expect(promoteReleaseCandidate({
+      ...options(fixture),
+      publicHistoryCheck: async () => undefined,
+    })).rejects.toThrow(/release tag.*ancestor.*main/i)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.base)
+  }, 30_000)
+
+  it('rejects a base-version tag aimed at a same-version governance commit', async () => {
+    const fixture = await promotionFixture({ sameVersionGovernance: true })
+    await git(fixture.source, [
+      'push', '--force', 'origin', `${fixture.base}:refs/tags/agent-v0.1.3`,
+    ])
+    await expect(promoteReleaseCandidate({
+      ...options(fixture),
+      publicHistoryCheck: async () => undefined,
+    })).rejects.toThrow(/tag.*exact release commit/i)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.base)
+  }, 30_000)
+
+  it('rejects a missing base-version tag', async () => {
+    const fixture = await promotionFixture()
+    await git(fixture.source, ['push', 'origin', ':refs/tags/agent-v0.1.3'])
+    await expect(promoteReleaseCandidate(options(fixture))).rejects.toThrow(/base release tag is missing/i)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.base)
+  }, 30_000)
+
+  it('rejects an annotated base-version tag', async () => {
+    const fixture = await promotionFixture()
+    await git(fixture.source, ['tag', '-f', '-a', 'agent-v0.1.3', fixture.releaseCommit,
+      '-m', 'release: publish @1f4bcai/agent@0.1.3'], {
+      GIT_COMMITTER_DATE: '2026-08-25T00:00:20Z',
+    })
+    await git(fixture.source, ['push', '--force', 'origin', 'refs/tags/agent-v0.1.3'])
+    await expect(promoteReleaseCandidate(options(fixture))).rejects.toThrow(/lightweight/i)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.base)
+  }, 30_000)
+
+  it('rejects an incomplete canonical-history fetch', async () => {
+    const fixture = await promotionFixture({ sameVersionGovernance: true })
+    await writeFile(join(fixture.remote, 'shallow'), `${fixture.base}\n`)
+    await expect(promoteReleaseCandidate({
+      ...options(fixture),
+      publicHistoryCheck: async () => undefined,
+    })).rejects.toThrow(/history must be complete|history.*failed|complete canonical.*failed/i)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.base)
+  }, 30_000)
+
+  it('rejects a future release tag before promotion', async () => {
+    const fixture = await promotionFixture()
+    await git(fixture.source, ['tag', 'agent-v0.1.5', fixture.base])
+    await git(fixture.source, ['push', 'origin', 'agent-v0.1.5'])
+    await expect(promoteReleaseCandidate(options(fixture))).rejects.toThrow(
+      /unpermitted release tag|tag does not match its package tree/i,
+    )
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.base)
+  }, 30_000)
+
   it('rejects a candidate whose raw parent is not the live canonical main', async () => {
     const fixture = await promotionFixture({ extraParent: true })
     await expect(promoteReleaseCandidate(options(fixture))).rejects.toThrow(/exact linear parent/i)
@@ -327,6 +442,33 @@ describe('App-only public release candidate promotion', () => {
       .toBe(raced.base)
   }, 30_000)
 
+  it('ignores only GitHub-managed pull refs and rejects other namespaces', async () => {
+    const fixture = await promotionFixture()
+    await git(fixture.source, [
+      'push', 'origin', `${fixture.base}:refs/pull/1/head`,
+    ])
+    const result = await promoteReleaseCandidate(options(fixture))
+    expect(result.promoted).toBe(true)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(fixture.candidate)
+    expect((await git(fixture.remote, ['rev-parse', 'refs/pull/1/head'])).stdout.trim())
+      .toBe(fixture.base)
+
+    const notes = await promotionFixture()
+    await git(notes.source, ['push', 'origin', `${notes.base}:refs/notes/release`])
+    await expect(promoteReleaseCandidate(options(notes))).rejects.toThrow(/public ref/i)
+    expect((await git(notes.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(notes.base)
+
+    const invalidPull = await promotionFixture()
+    await git(invalidPull.source, [
+      'push', 'origin', `${invalidPull.base}:refs/pull/0/head`,
+    ])
+    await expect(promoteReleaseCandidate(options(invalidPull))).rejects.toThrow(/public ref/i)
+    expect((await git(invalidPull.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
+      .toBe(invalidPull.base)
+  }, 30_000)
+
   it('leases existing release tags atomically and verifies the complete post-push ref set', async () => {
     const racedTag = await promotionFixture()
     await expect(promoteReleaseCandidate({
@@ -351,9 +493,12 @@ describe('App-only public release candidate promotion', () => {
           await git(postPush.source, ['push', 'origin', 'post-push-surprise'])
         },
       },
-    })).rejects.toThrow(/complete public ref set/i)
+    })).rejects.toThrow(/postcondition.*rolled back/i)
     expect((await git(postPush.remote, ['rev-parse', 'refs/heads/main'])).stdout.trim())
-      .toBe(postPush.candidate)
+      .toBe(postPush.base)
+    expect((await git(postPush.remote, [
+      'rev-parse', `refs/heads/${postPush.candidateRef}`,
+    ])).stdout.trim()).toBe(postPush.candidate)
   }, 30_000)
 
   it('fails closed on a missing or malformed App token without disclosing it', async () => {

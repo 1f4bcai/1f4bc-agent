@@ -202,11 +202,14 @@ function assertCandidateRef(candidateRef) {
   return candidateRef
 }
 
+const GITHUB_MANAGED_PULL_REF = /^refs\/pull\/[1-9][0-9]*\/(?:head|merge)$/
 function parseDirectPublicRefs(output) {
   const refs = new Map()
   for (const line of output.split('\n').filter(Boolean)) {
     const match = /^([0-9a-f]{40})\t(refs\/.+)$/.exec(line)
-    if (!match || refs.has(match[2])) throw new Error('canonical remote returned malformed public refs')
+    if (!match) throw new Error('canonical remote returned malformed public refs')
+    if (GITHUB_MANAGED_PULL_REF.test(match[2])) continue
+    if (refs.has(match[2])) throw new Error('canonical remote returned malformed public refs')
     refs.set(match[2], match[1])
   }
   return refs
@@ -232,6 +235,10 @@ function assertCandidateRefSet(refs, candidateRef, mainCommit, candidateCommit) 
 
 function sameRefSet(left, right) {
   return left.size === right.size && [...left].every(([ref, commit]) => right.get(ref) === commit)
+}
+
+function containsRefSet(actual, expected) {
+  return [...expected].every(([ref, commit]) => actual.get(ref) === commit)
 }
 
 async function remotePublicRefs(
@@ -311,8 +318,8 @@ async function assertPermittedReleaseTags(
   repository, refs, baseVersion, baseCommit, candidateVersionValue,
 ) {
   const tags = [...refs].filter(([ref]) => ref.startsWith('refs/tags/'))
-  if (refs.get(`refs/tags/agent-v${baseVersion}`) !== baseCommit) {
-    throw new Error('canonical base release tag is missing or does not target main')
+  if (!refs.has(`refs/tags/agent-v${baseVersion}`)) {
+    throw new Error('canonical base release tag is missing')
   }
   if (refs.has(`refs/tags/agent-v${candidateVersionValue}`)) {
     throw new Error('release candidate version already has a public tag')
@@ -338,6 +345,23 @@ async function assertPermittedReleaseTags(
     ])
     if (releaseCoordinates(root, manifest, lock, 'tag') !== match[1]) {
       throw new Error('canonical release tag version differs from its package tree')
+    }
+    const rawCommit = (await git(repository, ['cat-file', 'commit', expectedCommit], {
+      label: 'canonical release tag commit inspection',
+    })).stdout
+    const messageBoundary = rawCommit.indexOf('\n\n')
+    if (
+      messageBoundary < 0 ||
+      rawCommit.slice(messageBoundary + 2) !== `${RELEASE_MESSAGE_PREFIX}${match[1]}\n`
+    ) {
+      throw new Error('canonical release tag does not target an exact release commit')
+    }
+    try {
+      await git(repository, ['merge-base', '--is-ancestor', expectedCommit, baseCommit], {
+        label: 'canonical release tag ancestry inspection',
+      })
+    } catch {
+      throw new Error('canonical release tag is not an ancestor of main')
     }
   }
 }
@@ -438,6 +462,39 @@ async function createCandidateCheckout(
   return repository
 }
 
+async function createPublicHistoryCheckout(
+  root, fetchRemote, baseCommit, publicRefs,
+) {
+  const repository = join(root, 'history')
+  await git(root, ['init', '-b', 'main', repository], {
+    label: 'canonical release history checkout initialization',
+  })
+  await configureCandidateCheckout(repository)
+  await git(repository, [
+    'fetch', '--no-tags', fetchRemote,
+    '+refs/heads/main:refs/remotes/origin/main',
+  ], { label: 'complete canonical main history fetch' })
+  for (const ref of [...publicRefs.keys()].filter((value) => value.startsWith('refs/tags/')).sort()) {
+    await git(repository, [
+      'fetch', '--no-tags', fetchRemote, `+${ref}:${ref}`,
+    ], { label: 'complete canonical release tag fetch' })
+  }
+  const resolvedBase = (await git(repository, [
+    'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}',
+  ], { label: 'complete canonical main resolution' })).stdout.trim()
+  if (resolvedBase !== baseCommit) {
+    throw new Error('complete canonical history differs from the prechecked main')
+  }
+  await git(repository, ['checkout', '-B', 'main', baseCommit], {
+    label: 'complete canonical main checkout',
+  })
+  const shallow = (await git(repository, ['rev-parse', '--is-shallow-repository'], {
+    label: 'canonical release history completeness check',
+  })).stdout.trim()
+  if (shallow !== 'false') throw new Error('canonical release history must be complete')
+  return repository
+}
+
 async function assertAuthorityCheckout(authorityRoot, baseCommit, fetchRemote, allowTestRemote) {
   const root = await realpath(resolve(authorityRoot))
   const status = (await git(root, ['status', '--porcelain=v1', '--untracked-files=all'], {
@@ -487,12 +544,16 @@ export async function promoteReleaseCandidate(options) {
     pushRemote = TRUSTED_REMOTE,
     releasePreflight = defaultReleasePreflight,
     candidateCiCheck = requireSuccessfulCandidateCi,
+    publicHistoryCheck = verifyPublicTree,
     allowTestRemote = false,
     releaseAppToken,
     hooks = {},
   } = options ?? {}
   if (mode !== 'verify' && mode !== 'promote') throw new Error('candidate mode must be verify or promote')
   assertReleaseAppContext(context)
+  if (!allowTestRemote && publicHistoryCheck !== verifyPublicTree) {
+    throw new Error('production public history verification cannot be overridden')
+  }
   if (mode === 'promote') assertReleaseAppToken(releaseAppToken)
   const baseCommit = exactSha(rawBaseCommit, 'canonical main')
   const candidateCommit = exactSha(rawCandidateCommit, 'release candidate')
@@ -520,14 +581,18 @@ export async function promoteReleaseCandidate(options) {
     const candidate = await createCandidateCheckout(
       temporary, fetchRemote, baseCommit, candidateCommit, candidateRef, initialRefs,
     )
+    const publicHistory = await createPublicHistoryCheckout(
+      temporary, fetchRemote, baseCommit, initialRefs,
+    )
     const { version, baseVersion, manifest } = await candidateVersion(candidate, baseCommit)
     if (candidateRef !== `agent-candidate-${version}-${candidateCommit.slice(0, 12)}`) {
       throw new Error('release candidate ref does not match its version and commit')
     }
     await assertRawCandidateCommit(candidate, candidateCommit, baseCommit, version)
     await assertPinnedAuthorityUnchanged(candidate, baseCommit, candidateCommit)
+    await publicHistoryCheck(publicHistory)
     await assertPermittedReleaseTags(
-      candidate, initialRefs, baseVersion, baseCommit, version,
+      publicHistory, initialRefs, baseVersion, baseCommit, version,
     )
     await verifyPublicTree(candidate, { mode: 'snapshot-only' })
     await candidateCiCheck({
@@ -583,15 +648,48 @@ export async function promoteReleaseCandidate(options) {
       },
     })
     await hooks.afterPush?.()
-    const finalOutput = (await git(authority, ['ls-remote', '--refs', fetchRemote], {
-      label: 'promoted complete public ref confirmation',
-    })).stdout
-    const finalRefs = parseDirectPublicRefs(finalOutput)
     const expectedFinalRefs = new Map(initialRefs)
     expectedFinalRefs.set('refs/heads/main', candidateCommit)
     expectedFinalRefs.delete(`refs/heads/${candidateRef}`)
-    if (!sameRefSet(finalRefs, expectedFinalRefs)) {
-      throw new Error('atomic promotion completed but the complete public ref set could not be confirmed')
+    let postconditionOk = false
+    try {
+      const finalOutput = (await git(authority, ['ls-remote', '--refs', fetchRemote], {
+        label: 'promoted complete public ref confirmation',
+      })).stdout
+      postconditionOk = sameRefSet(parseDirectPublicRefs(finalOutput), expectedFinalRefs)
+    } catch {
+      postconditionOk = false
+    }
+    if (!postconditionOk) {
+      let rollbackConfirmed = false
+      try {
+        await git(candidate, [
+          'push', '--atomic', '--porcelain',
+          `--force-with-lease=refs/heads/main:${candidateCommit}`,
+          `--force-with-lease=refs/heads/${candidateRef}:`,
+          ...releaseTags.map(([ref, commit]) => `--force-with-lease=${ref}:${commit}`),
+          pushRemote,
+          `${baseCommit}:refs/heads/main`,
+          `${candidateCommit}:refs/heads/${candidateRef}`,
+          ...releaseTags.map(([ref, commit]) => `${commit}:${ref}`),
+        ], {
+          label: 'lease-protected promotion rollback',
+          env: allowTestRemote ? {} : {
+            GIT_ASKPASS: askpass,
+            RELEASE_APP_TOKEN: releaseAppToken,
+          },
+        })
+        const rollbackOutput = (await git(authority, ['ls-remote', '--refs', fetchRemote], {
+          label: 'rolled-back complete public ref confirmation',
+        })).stdout
+        rollbackConfirmed = containsRefSet(parseDirectPublicRefs(rollbackOutput), initialRefs)
+      } catch {
+        rollbackConfirmed = false
+      }
+      if (!rollbackConfirmed) {
+        throw new Error('atomic promotion postcondition failed and rollback could not be confirmed')
+      }
+      throw new Error('atomic promotion postcondition failed; verified refs were rolled back')
     }
     return { ...verified, promoted: true }
   } finally {

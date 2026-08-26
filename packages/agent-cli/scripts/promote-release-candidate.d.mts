@@ -51,6 +51,7 @@ export function promoteReleaseCandidate(options: {
   releaseAppToken?: string
   releasePreflight?: (options: Record<string, unknown>) => Promise<unknown>
   candidateCiCheck?: (options: CandidateCiExpectation) => Promise<CandidateCiVerification>
+  publicHistoryCheck?: (repository: string) => Promise<unknown>
   hooks?: {
     beforeRefCheck?: () => void | Promise<void>
     beforePush?: () => void | Promise<void>

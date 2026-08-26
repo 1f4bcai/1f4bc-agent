@@ -80,6 +80,9 @@ const LEGACY_CANONICAL_MAIN = '56d884c752a4ee44eef8de9208858e9ef8fc6423'
 const PUBLIC_CI_AUTHORITY_REPAIR_MESSAGE = 'chore: repair agent candidate CI authority\n'
 const PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP = String(Date.parse('2026-08-26T17:30:00Z') / 1000)
 const PUBLIC_CI_AUTHORITY_REPAIR_PARENT = '9f16eb8a351fd39a1e6f79a6d130b96c0161dd13'
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_MESSAGE = 'chore: repair agent promotion authority\n'
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_TIMESTAMP = String(Date.parse('2026-08-26T23:30:00Z') / 1000)
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT = 'c57e8447a7513554d4cec6885da5855af5aaba62'
 const AUTHORITY_BOOTSTRAP_PATHS = Object.freeze([
   '.github/workflows/agent-cli-public-ci.yml',
   '.github/workflows/promote-agent-cli-candidate.yml',
@@ -98,6 +101,39 @@ const PUBLIC_CI_AUTHORITY_REPAIR_PATHS = Object.freeze([
   'packages/agent-cli/test/public-export.test.ts',
   'packages/agent-cli/test/release-pipeline.test.ts',
 ])
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS = Object.freeze([
+  'packages/agent-cli/scripts/promote-release-candidate.d.mts',
+  'packages/agent-cli/scripts/promote-release-candidate.mjs',
+  'packages/agent-cli/scripts/verify-public-tree.d.mts',
+  'packages/agent-cli/scripts/verify-public-tree.mjs',
+  'packages/agent-cli/test/candidate-promotion.test.ts',
+  'packages/agent-cli/test/public-export.test.ts',
+])
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_PATH =
+  'packages/agent-cli/scripts/verify-public-tree.mjs'
+// This value commits to this file after replacing this exact declaration's
+// digest with 64 zeroes. That normalization avoids a recursive self-hash while
+// still pinning every meaningful byte, including the approved hashes below.
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_SHA256 =
+  '72cb86616cb41f16a6126908a49f9193' +
+  'aab43e4ddcb3c76951ca610f78dc1d6b'
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_SHA256 = Object.freeze({
+  'packages/agent-cli/scripts/promote-release-candidate.d.mts':
+    'ef92a1b2c76fd240dfcbf69bca2b2a09' +
+    'fe5f05c83f39e9672ec9f51cc0405778',
+  'packages/agent-cli/scripts/promote-release-candidate.mjs':
+    '111acc84669c4c4f64c04202b2139ba8' +
+    'b0b2768471294308aab7cf69830b64e3',
+  'packages/agent-cli/scripts/verify-public-tree.d.mts':
+    '7ee4b1e18b963c51937e034e8a95c050' +
+    '38dcb4dc7507ff05f78f3906d7e5464a',
+  'packages/agent-cli/test/candidate-promotion.test.ts':
+    '3613196d18607d1b19d32e50f7172fc4' +
+    '99bb5c34292cf9d44977a40a00328641',
+  'packages/agent-cli/test/public-export.test.ts':
+    'c0c25857335beb9eea3a59c0b60e07e4' +
+    '516018a04198012cb2c435800009cdf2',
+})
 const REPLACEMENT_ROOT_VERSION = '0.1.3'
 const STABLE_SEMVER = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/
 const RETIRED_RELEASE_VERSIONS = new Set(['0.1.0', '0.1.1', '0.1.2'])
@@ -443,6 +479,81 @@ async function assertPublicCiAuthorityRepairDiff(repository, commit) {
   }
 }
 
+export async function assertReleasePromotionAuthorityRepairContent(repository, commit) {
+  const committedPaths = [
+    RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_PATH,
+    ...Object.keys(RELEASE_PROMOTION_AUTHORITY_REPAIR_SHA256),
+  ].sort()
+  if (
+    new Set(committedPaths).size !== committedPaths.length ||
+    JSON.stringify(committedPaths) !==
+      JSON.stringify([...RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS].sort())
+  ) {
+    throw new Error('public release-promotion authority-repair commitment map is incomplete')
+  }
+  const { stdout } = await git(repository, [
+    'diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', commit,
+  ], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+  const changed = stdout.split('\0').filter(Boolean).sort()
+  if (JSON.stringify(changed) !== JSON.stringify([...RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS].sort())) {
+    throw new Error('public release-promotion authority-repair commit differs from the exact approved path set')
+  }
+  const { stdout: treeOutput } = await git(repository, [
+    'ls-tree', '-z', commit, '--', ...RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS,
+  ], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+  const treePaths = new Set()
+  for (const entry of treeOutput.split('\0').filter(Boolean)) {
+    const match = /^100644 blob [0-9a-f]{40,64}\t(.+)$/.exec(entry)
+    if (!match || treePaths.has(match[1])) {
+      throw new Error('public release-promotion authority-repair commit has unapproved file modes')
+    }
+    treePaths.add(match[1])
+  }
+  if (
+    treePaths.size !== RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS.length ||
+    RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS.some((path) => !treePaths.has(path))
+  ) {
+    throw new Error('public release-promotion authority-repair commit has unapproved file modes')
+  }
+  for (const [path, expected] of Object.entries(RELEASE_PROMOTION_AUTHORITY_REPAIR_SHA256)) {
+    const { stdout: contents } = await git(repository, ['cat-file', 'blob', `${commit}:${path}`], {
+      encoding: null,
+      maxBuffer: MAX_PUBLIC_SOURCE_BYTES + 1,
+    })
+    const actual = createHash('sha256').update(contents).digest('hex')
+    if (actual !== expected) {
+      throw new Error('public release-promotion authority-repair commit contains unapproved bytes')
+    }
+  }
+  const { stdout: selfContents } = await git(
+    repository,
+    ['cat-file', 'blob', `${commit}:${RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_PATH}`],
+    { encoding: null, maxBuffer: MAX_PUBLIC_SOURCE_BYTES + 1 },
+  )
+  const self = decodePublicText(
+    selfContents,
+    'public release-promotion authority-repair verifier',
+  )
+  if (!Buffer.from(self, 'utf8').equals(selfContents)) {
+    throw new Error('public release-promotion authority-repair verifier contains unapproved bytes')
+  }
+  const declarationFor = (digest) => [
+    'const RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_SHA256 =',
+    `  '${digest.slice(0, 32)}' +`,
+    `  '${digest.slice(32)}'`,
+  ].join('\n')
+  const approvedDeclaration = declarationFor(RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_SHA256)
+  if (self.split(approvedDeclaration).length !== 2) {
+    throw new Error('public release-promotion authority-repair verifier is not self-committed')
+  }
+  const normalizedDeclaration = declarationFor('0'.repeat(64))
+  const normalized = self.replace(approvedDeclaration, normalizedDeclaration)
+  const actualSelf = createHash('sha256').update(normalized, 'utf8').digest('hex')
+  if (actualSelf !== RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_SHA256) {
+    throw new Error('public release-promotion authority-repair verifier contains unapproved bytes')
+  }
+}
+
 export function assertPublicCiAuthorityRepairPlacement({
   commit,
   parent,
@@ -456,6 +567,22 @@ export function assertPublicCiAuthorityRepairPlacement({
     authorTimestamp !== PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP
   ) {
     throw new Error('public CI authority-repair commit is not the exact pinned history extension')
+  }
+}
+
+export function assertReleasePromotionAuthorityRepairMetadata({
+  commit,
+  parent,
+  version,
+  authorTimestamp,
+}) {
+  if (
+    commit === RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT ||
+    parent !== RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT ||
+    version !== REPLACEMENT_ROOT_VERSION ||
+    authorTimestamp !== RELEASE_PROMOTION_AUTHORITY_REPAIR_TIMESTAMP
+  ) {
+    throw new Error('public release-promotion authority repair is not the exact pinned history extension')
   }
 }
 
@@ -491,7 +618,36 @@ async function assertPublicCommitMetadata(repository, commit, text, versionCache
   }
   const version = await publicPackageVersionAt(repository, commit, versionCache)
   if (body === `${PUBLIC_RELEASE_MESSAGE_PREFIX}${version}\n`) {
-    return { authorityBootstrap: false, authorityRepair: false, version }
+    return {
+      authorityBootstrap: false,
+      authorityRepair: false,
+      promotionAuthorityRepair: false,
+      version,
+    }
+  }
+  if (body === RELEASE_PROMOTION_AUTHORITY_REPAIR_MESSAGE) {
+    if (parents.length !== 1) {
+      throw new Error('public release-promotion authority repair is not the exact pinned history extension')
+    }
+    assertReleasePromotionAuthorityRepairMetadata({
+      commit,
+      parent: parents[0].slice('parent '.length),
+      version,
+      authorTimestamp: author[1],
+    })
+    const parentVersion = await publicPackageVersionAt(
+      repository, RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT, versionCache,
+    )
+    if (parentVersion !== REPLACEMENT_ROOT_VERSION) {
+      throw new Error('public release-promotion authority repair is not based on the pinned authority main')
+    }
+    await assertReleasePromotionAuthorityRepairContent(repository, commit)
+    return {
+      authorityBootstrap: false,
+      authorityRepair: false,
+      promotionAuthorityRepair: true,
+      version,
+    }
   }
   if (body === PUBLIC_CI_AUTHORITY_REPAIR_MESSAGE) {
     if (parents.length !== 1) {
@@ -510,7 +666,12 @@ async function assertPublicCommitMetadata(repository, commit, text, versionCache
       throw new Error('public CI authority repair is not based on the pinned authority main')
     }
     await assertPublicCiAuthorityRepairDiff(repository, commit)
-    return { authorityBootstrap: false, authorityRepair: true, version }
+    return {
+      authorityBootstrap: false,
+      authorityRepair: true,
+      promotionAuthorityRepair: false,
+      version,
+    }
   }
   if (
     body !== AUTHORITY_BOOTSTRAP_MESSAGE ||
@@ -529,7 +690,12 @@ async function assertPublicCommitMetadata(repository, commit, text, versionCache
     throw new Error('public authority bootstrap is not based on the replacement root')
   }
   await assertAuthorityBootstrapDiff(repository, commit)
-  return { authorityBootstrap: true, authorityRepair: false, version }
+  return {
+    authorityBootstrap: true,
+    authorityRepair: false,
+    promotionAuthorityRepair: false,
+    version,
+  }
 }
 
 async function assertPublicRefs(repository, versionCache) {
@@ -567,6 +733,14 @@ async function assertPublicRefs(repository, versionCache) {
     const version = await publicPackageVersionAt(repository, commit, versionCache)
     if (ref !== `refs/tags/agent-v${version}`) {
       throw new Error('public release tag does not match its package tree')
+    }
+    const rawCommit = await readGitObjectText(repository, 'commit', commit)
+    const messageBoundary = rawCommit.indexOf('\n\n')
+    if (
+      messageBoundary < 0 ||
+      rawCommit.slice(messageBoundary + 2) !== `${PUBLIC_RELEASE_MESSAGE_PREFIX}${version}\n`
+    ) {
+      throw new Error('public release tag does not target an exact release commit')
     }
     releaseTags.push(commit)
   }
@@ -784,6 +958,7 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
     const versionCache = new Map()
     const authorityBootstrapCommits = new Set()
     const authorityRepairCommits = new Set()
+    const promotionAuthorityRepairCommits = new Set()
     const commits = commitListing.split('\n').filter(Boolean)
     for (const commit of commits) {
       const { stdout: treeListing } = await git(
@@ -831,6 +1006,7 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
         const metadata = await assertPublicCommitMetadata(repository, hash, text, versionCache)
         if (metadata.authorityBootstrap) authorityBootstrapCommits.add(hash)
         if (metadata.authorityRepair) authorityRepairCommits.add(hash)
+        if (metadata.promotionAuthorityRepair) promotionAuthorityRepairCommits.add(hash)
         continue
       }
       if (type !== 'blob') continue
@@ -897,11 +1073,13 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
     let previousCommit
     let authorityBootstrapSeen = false
     let authorityRepairSeen = false
+    let promotionAuthorityRepairSeen = false
     const chronologicalCommits = chronologicalListing.split('\n').filter(Boolean)
     for (const commit of chronologicalCommits) {
       const version = await publicPackageVersionAt(repository, commit, versionCache)
       const authorityBootstrap = authorityBootstrapCommits.has(commit)
       const authorityRepair = authorityRepairCommits.has(commit)
+      const promotionAuthorityRepair = promotionAuthorityRepairCommits.has(commit)
       if (authorityBootstrap) {
         if (
           authorityBootstrapSeen ||
@@ -923,6 +1101,17 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
           throw new Error('public history CI authority repair is not the one-time pinned extension')
         }
         authorityRepairSeen = true
+      } else if (promotionAuthorityRepair) {
+        if (
+          promotionAuthorityRepairSeen ||
+          !authorityRepairSeen ||
+          previousCommit !== RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT ||
+          previousVersion !== REPLACEMENT_ROOT_VERSION ||
+          version !== REPLACEMENT_ROOT_VERSION
+        ) {
+          throw new Error('public history release-promotion authority repair is not the one-time pinned extension')
+        }
+        promotionAuthorityRepairSeen = true
       } else if (
         previousVersion !== undefined && compareStableVersions(previousVersion, version) >= 0
       ) {
@@ -944,6 +1133,13 @@ export async function verifyPublicTree(root = process.cwd(), options = {}) {
       !authorityRepairSeen
     ) {
       throw new Error('public replacement history is missing the pinned CI authority repair')
+    }
+    if (
+      chronologicalCommits.includes(RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT) &&
+      chronologicalCommits.at(-1) !== RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT &&
+      !promotionAuthorityRepairSeen
+    ) {
+      throw new Error('public replacement history is missing the pinned release-promotion authority repair')
     }
   }
 

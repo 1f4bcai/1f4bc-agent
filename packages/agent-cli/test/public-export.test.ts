@@ -26,6 +26,8 @@ import {
 } from '../scripts/export-public-source.mjs'
 import {
   assertPublicCiAuthorityRepairPlacement,
+  assertReleasePromotionAuthorityRepairContent,
+  assertReleasePromotionAuthorityRepairMetadata,
   verifyPublicTree,
 } from '../scripts/verify-public-tree.mjs'
 
@@ -62,6 +64,18 @@ const PUBLIC_GIT_MESSAGE = `release: publish @1f4bcai/agent@${CURRENT_VERSION}`
 const PUBLIC_GIT_DATE = '2026-08-25T00:00:00Z'
 const PUBLIC_CI_AUTHORITY_REPAIR_PARENT = '9f16eb8a351fd39a1e6f79a6d130b96c0161dd13'
 const PUBLIC_CI_AUTHORITY_REPAIR_TIMESTAMP = String(Date.parse('2026-08-26T17:30:00Z') / 1000)
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT = 'c57e8447a7513554d4cec6885da5855af5aaba62'
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_TIMESTAMP = String(Date.parse('2026-08-26T23:30:00Z') / 1000)
+const RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS = [
+  'packages/agent-cli/scripts/promote-release-candidate.d.mts',
+  'packages/agent-cli/scripts/promote-release-candidate.mjs',
+  'packages/agent-cli/scripts/verify-public-tree.d.mts',
+  'packages/agent-cli/scripts/verify-public-tree.mjs',
+  'packages/agent-cli/test/candidate-promotion.test.ts',
+  'packages/agent-cli/test/public-export.test.ts',
+] as const
+const RELEASE_PROMOTION_AUTHORITY_SELF_DECLARATION =
+  /^const RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_SHA256 =\n  '[0-9a-f]{32}' \+\n  '[0-9a-f]{32}'$/m
 
 function releaseMessage(version: string) {
   return `release: publish @1f4bcai/agent@${version}`
@@ -1294,6 +1308,134 @@ it('recognizes only the exact pinned one-time public CI authority-repair placeme
   }
 })
 
+it('recognizes only the pinned one-time release-promotion authority repair metadata', () => {
+  const valid = {
+    commit: 'a'.repeat(40),
+    parent: RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT,
+    version: REPLACEMENT_ROOT_VERSION,
+    authorTimestamp: RELEASE_PROMOTION_AUTHORITY_REPAIR_TIMESTAMP,
+  }
+  expect(() => assertReleasePromotionAuthorityRepairMetadata(valid)).not.toThrow()
+  for (const [field, value] of [
+    ['commit', RELEASE_PROMOTION_AUTHORITY_REPAIR_PARENT],
+    ['parent', 'b'.repeat(40)],
+    ['version', CURRENT_VERSION],
+    ['authorTimestamp', String(Number(RELEASE_PROMOTION_AUTHORITY_REPAIR_TIMESTAMP) + 1)],
+  ] as const) {
+    expect(() => assertReleasePromotionAuthorityRepairMetadata({ ...valid, [field]: value }))
+      .toThrow(/exact pinned history extension/i)
+  }
+})
+
+it('authenticates every reviewed release-promotion repair byte', async () => {
+  const destination = await exportedRepository()
+  const reviewed = new Map(await Promise.all(
+    RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS.map(async (path) => [
+      path,
+      await readFile(join(destination, path)),
+    ] as const),
+  ))
+  for (const path of RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS) {
+    await writeFile(join(destination, path), `pre-repair bytes for ${path}\n`)
+  }
+  await execFileAsync('git', ['add', '--all'], { cwd: destination })
+  await execFileAsync('git', ['commit', '-m', 'test fixture repair parent'], {
+    cwd: destination,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2026-08-26T23:29:00Z',
+      GIT_COMMITTER_DATE: '2026-08-26T23:29:00Z',
+    },
+  })
+  const parent = (await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: destination,
+    encoding: 'utf8',
+  })).stdout.trim()
+  const installRepair = async (
+    label: string,
+    mutate?: (files: Map<string, Buffer>) => void,
+    executablePath?: string,
+  ) => {
+    await execFileAsync('git', ['reset', '--hard', parent], { cwd: destination })
+    const files = new Map([...reviewed].map(([path, contents]) => [
+      path,
+      Buffer.from(contents),
+    ]))
+    mutate?.(files)
+    for (const [path, contents] of files) await writeFile(join(destination, path), contents)
+    await execFileAsync('git', ['add', '--all'], { cwd: destination })
+    if (executablePath) {
+      await execFileAsync('git', ['update-index', '--chmod=+x', executablePath], {
+        cwd: destination,
+      })
+    }
+    await execFileAsync('git', ['commit', '-m', label], {
+      cwd: destination,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: '2026-08-26T23:30:00Z',
+        GIT_COMMITTER_DATE: '2026-08-26T23:30:00Z',
+      },
+    })
+    return (await execFileAsync('git', ['rev-parse', 'HEAD'], {
+      cwd: destination,
+      encoding: 'utf8',
+    })).stdout.trim()
+  }
+
+  const approved = await installRepair('approved repair bytes')
+  await expect(assertReleasePromotionAuthorityRepairContent(destination, approved))
+    .resolves.toBeUndefined()
+
+  for (const path of RELEASE_PROMOTION_AUTHORITY_REPAIR_PATHS) {
+    const altered = await installRepair(`same paths with altered bytes in ${path}`, (files) => {
+      files.set(path, Buffer.concat([files.get(path)!, Buffer.from('\n// unreviewed byte\n')]))
+    })
+    await expect(assertReleasePromotionAuthorityRepairContent(destination, altered))
+      .rejects.toThrow(/unapproved bytes/i)
+  }
+
+  const missingMarker = await installRepair('same paths with a missing marker', (files) => {
+    const path = 'packages/agent-cli/scripts/verify-public-tree.mjs'
+    const source = Buffer.from(files.get(path)!).toString('utf8')
+    files.set(path, Buffer.from(source.replace(
+      RELEASE_PROMOTION_AUTHORITY_SELF_DECLARATION,
+      [
+        'const RELEASE_PROMOTION_AUTHORITY_REPAIR_SELF_SHA256 =',
+        `  '${'f'.repeat(32)}' +`,
+        `  '${'f'.repeat(32)}'`,
+      ].join('\n'),
+    )))
+  })
+  await expect(assertReleasePromotionAuthorityRepairContent(destination, missingMarker))
+    .rejects.toThrow(/self-committed/i)
+
+  const executable = await installRepair(
+    'same paths with an executable mode',
+    undefined,
+    'packages/agent-cli/scripts/promote-release-candidate.mjs',
+  )
+  await expect(assertReleasePromotionAuthorityRepairContent(destination, executable))
+    .rejects.toThrow(/file modes/i)
+
+  const leadingBom = await installRepair('same paths with a leading UTF-8 BOM', (files) => {
+    const path = 'packages/agent-cli/scripts/verify-public-tree.mjs'
+    files.set(path, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), files.get(path)!]))
+  })
+  await expect(assertReleasePromotionAuthorityRepairContent(destination, leadingBom))
+    .rejects.toThrow(/unapproved bytes/i)
+
+  const duplicatedMarker = await installRepair('same paths with a duplicate marker', (files) => {
+    const path = 'packages/agent-cli/scripts/verify-public-tree.mjs'
+    const source = Buffer.from(files.get(path)!).toString('utf8')
+    const marker = source.match(RELEASE_PROMOTION_AUTHORITY_SELF_DECLARATION)?.[0]
+    expect(marker).toBeTruthy()
+    files.set(path, Buffer.from(`${source}\n${marker}\n`))
+  })
+  await expect(assertReleasePromotionAuthorityRepairContent(destination, duplicatedMarker))
+    .rejects.toThrow(/self-committed/i)
+}, 20_000)
+
 it('rejects a release message whose version differs from its tree', async () => {
   const destination = await exportedRepository()
   await execFileAsync(
@@ -1379,6 +1521,22 @@ it('rejects annotated release tags', async () => {
     { cwd: annotated },
   )
   await expect(verifyPublicTree(annotated)).rejects.toThrow(/lightweight release tags/i)
+})
+
+it('rejects a release tag aimed at a same-version non-release commit', async () => {
+  const destination = await exportedRepository()
+  await execFileAsync('git', ['commit', '--allow-empty', '-m', 'miscellaneous cleanup'], {
+    cwd: destination,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2026-08-25T00:01:00Z',
+      GIT_COMMITTER_DATE: '2026-08-25T00:01:00Z',
+    },
+  })
+  await execFileAsync('git', ['tag', `agent-v${CURRENT_VERSION}`], { cwd: destination })
+  await expect(verifyPublicTree(destination)).rejects.toThrow(
+    /release tag.*exact release commit|release commit message/i,
+  )
 })
 
 it('accepts the canonical optional origin refs', async () => {
