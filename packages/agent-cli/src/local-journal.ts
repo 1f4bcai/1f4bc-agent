@@ -47,8 +47,14 @@ function assertPrivateFile(info: Stats, label: string): void {
   if ((info.mode & 0o077) !== 0) throw new Error(`${label} has unsafe permissions`)
 }
 
-async function ensurePrivateDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 })
+export async function ensurePrivateDirectory(path: string): Promise<void> {
+  try {
+    await mkdir(path, { recursive: true, mode: 0o700 })
+  } catch (error) {
+    // mkdir reports EEXIST for a final symlink/file on some platforms; lstat
+    // below provides the uniform no-follow validation and safe diagnostic.
+    if (errorCode(error) !== 'EEXIST') throw error
+  }
   const initial = await lstat(path)
   assertPrivateDirectory(initial, path)
   const flags = constants.O_RDONLY |

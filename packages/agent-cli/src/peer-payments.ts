@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFileSync, realpathSync } from 'node:fs'
-import { chmod, mkdir, readdir } from 'node:fs/promises'
+import { open, readdir, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
   decodePaymentRequiredHeader,
@@ -15,7 +15,13 @@ import {
   appendPaymentIdentifierToExtensions,
   generatePaymentId,
 } from '@x402/extensions/payment-identifier'
-import { getAddress, isAddress, recoverTypedDataAddress, type Hex } from 'viem'
+import {
+  encodeFunctionData,
+  getAddress,
+  isAddress,
+  recoverTypedDataAddress,
+  type Hex,
+} from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { FetchLike } from './api.js'
 import { sha256Hex } from './api.js'
@@ -29,13 +35,26 @@ import {
   toBase64,
   type AgentIdentity,
 } from './keys.js'
-import { atomicWritePrivate, readPrivateFile, withFileLock } from './local-journal.js'
+import {
+  atomicCreatePrivate,
+  atomicWritePrivate,
+  ensurePrivateDirectory,
+  readPrivateFile,
+  withFileLock,
+} from './local-journal.js'
 import {
   claimAuthorizedPaymentControl,
+  McpSpendGuard,
   type McpPaymentControl,
 } from './mcp-payments.js'
 import { assertNoIdentitySecrets } from './secret-safety.js'
 import { spendPolicyScope } from './spend-scope.js'
+import {
+  claimedSpendControlMetadata,
+  consumeTerminalPaymentClear,
+  terminalPaymentCleared,
+  TerminalPaymentCleared,
+} from './terminal-clear.js'
 import { usdcEip712Domain } from './usdc-domain.js'
 
 const ZERO_ADDRESS = `0x${'0'.repeat(40)}`
@@ -49,15 +68,35 @@ const TRANSFER_TOPIC =
   '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
 const AUTHORIZATION_USED_TOPIC =
   '0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5'
+const TERMINAL_RPC_QUORUM_SIZE = 3
+const AUTHORIZATION_STATE_ABI = [{
+  type: 'function',
+  name: 'authorizationState',
+  stateMutability: 'view',
+  inputs: [
+    { name: 'authorizer', type: 'address' },
+    { name: 'nonce', type: 'bytes32' },
+  ],
+  outputs: [{ name: '', type: 'bool' }],
+}] as const
 export const USDC_BY_CHAIN_ID: Readonly<Record<number, `0x${string}`>> = Object.freeze({
   8453: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   84532: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
 })
 type JsonRecord = Record<string, unknown>
 
+class TerminalPeerPaymentBlocked extends Error {
+  readonly paymentMayHaveOccurred = false as const
+
+  constructor() {
+    super('peer-payment authorization is terminal; clear it before retrying')
+    this.name = 'TerminalPeerPaymentBlocked'
+  }
+}
+
 type PeerPaymentAttemptBase = {
   version: 1
-  state: 'pending' | 'settled'
+  state: 'pending' | 'settled' | 'terminal'
   paymentId: string
   publicKey: string
   wallet: `0x${string}`
@@ -80,7 +119,29 @@ type SettledPeerPaymentAttempt = PeerPaymentAttemptBase & {
   settledAt: number
   evidence: PeerPaymentEvidence
 }
-type PeerPaymentAttempt = PendingPeerPaymentAttempt | SettledPeerPaymentAttempt
+type PeerAuthorizationExpiryProof = {
+  rpcOriginHash: string
+  finalizedBlockNumber: string
+  finalizedBlockHash: `0x${string}`
+  finalizedBlockTimestamp: string
+  authorizationState: false
+}
+type TerminalPeerPaymentAttempt = PeerPaymentAttemptBase & {
+  state: 'terminal'
+  terminalAt: number
+  terminalProofVersion: 1
+  authorizationNonce: `0x${string}`
+  validBefore: string
+  quorum: [
+    PeerAuthorizationExpiryProof,
+    PeerAuthorizationExpiryProof,
+    PeerAuthorizationExpiryProof,
+  ]
+}
+type PeerPaymentAttempt =
+  | PendingPeerPaymentAttempt
+  | SettledPeerPaymentAttempt
+  | TerminalPeerPaymentAttempt
 
 export type PeerPaymentRequest = {
   url: string
@@ -126,10 +187,18 @@ export type PeerPaymentClientOptions = {
   chainIdOverride?: number
   /** Trusted Base RPC used to prove the exact finalized USDC transfer. */
   rpcUrl: string
+  /** Two additional, independently operated RPC origins required for terminal clear. */
+  quorumRpcUrls?: readonly string[]
   fetch?: FetchLike
   rpcFetch?: FetchLike
   now?: () => number
   timeoutMs?: number
+}
+
+export type PeerPaymentTerminalClearResult = {
+  state: 'terminal'
+  cleared: true
+  archived: true
 }
 
 export type UsdcBalanceEvidence = {
@@ -316,6 +385,28 @@ function logicalKey(
   ].join('\n'))
 }
 
+function expectedAttemptFromPrepared(
+  identity: AgentIdentity,
+  input: PreparedPeerPaymentRequest,
+  asset: `0x${string}`,
+): Omit<
+  PeerPaymentAttemptBase,
+  'version' | 'state' | 'paymentId' | 'headerName' | 'headerValue' | 'createdAt'
+> {
+  return {
+    publicKey: identity.publicKey,
+    wallet: identity.wallet,
+    chainId: identity.chainId,
+    url: input.url,
+    method: input.method,
+    ...(input.contentType ? { contentType: input.contentType } : {}),
+    bodyHash: bodyHash(input.body),
+    amountAtomic: input.amountAtomic.toString(),
+    payTo: input.payTo,
+    asset,
+  }
+}
+
 function peerPaymentRoot(identityPath: string): string {
   return join(dirname(identityPath), 'peer-payment-attempts')
 }
@@ -328,13 +419,39 @@ function peerPaymentFile(identityPath: string, publicKey: string, key: string): 
   return join(peerPaymentDirectory(identityPath, publicKey), `${key}.json`)
 }
 
+function peerPaymentArchiveDirectory(identityPath: string, publicKey: string): string {
+  return join(peerPaymentDirectory(identityPath, publicKey), 'terminal-archive')
+}
+
 async function ensurePrivateJournalDirectories(identityPath: string, publicKey: string): Promise<void> {
   const root = peerPaymentRoot(identityPath)
   const directory = peerPaymentDirectory(identityPath, publicKey)
-  await mkdir(root, { recursive: true, mode: 0o700 })
-  await chmod(root, 0o700)
-  await mkdir(directory, { recursive: true, mode: 0o700 })
-  await chmod(directory, 0o700)
+  await ensurePrivateDirectory(root)
+  await ensurePrivateDirectory(directory)
+}
+
+async function ensurePrivateArchiveDirectory(identityPath: string, publicKey: string): Promise<void> {
+  await ensurePrivateJournalDirectories(identityPath, publicKey)
+  const directory = peerPaymentArchiveDirectory(identityPath, publicKey)
+  await ensurePrivateDirectory(directory)
+}
+
+function parseAuthorizationExpiryProof(value: unknown): PeerAuthorizationExpiryProof {
+  if (
+    !isRecord(value) ||
+    typeof value.rpcOriginHash !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(value.rpcOriginHash) ||
+    typeof value.finalizedBlockNumber !== 'string' ||
+    !/^(?:0|[1-9][0-9]*)$/.test(value.finalizedBlockNumber) ||
+    typeof value.finalizedBlockHash !== 'string' ||
+    !/^0x[0-9a-f]{64}$/.test(value.finalizedBlockHash) ||
+    typeof value.finalizedBlockTimestamp !== 'string' ||
+    !/^(?:0|[1-9][0-9]*)$/.test(value.finalizedBlockTimestamp) ||
+    value.authorizationState !== false
+  ) {
+    throw new Error('peer-payment terminal proof is invalid')
+  }
+  return value as PeerAuthorizationExpiryProof
 }
 
 function parseEvidence(value: unknown): PeerPaymentEvidence {
@@ -369,7 +486,7 @@ function parseAttempt(value: unknown): PeerPaymentAttempt {
   if (
     !isRecord(value) ||
     value.version !== 1 ||
-    (value.state !== 'pending' && value.state !== 'settled') ||
+    (value.state !== 'pending' && value.state !== 'settled' && value.state !== 'terminal') ||
     typeof value.paymentId !== 'string' ||
     typeof value.publicKey !== 'string' ||
     typeof value.wallet !== 'string' ||
@@ -388,6 +505,36 @@ function parseAttempt(value: unknown): PeerPaymentAttempt {
     throw new Error('peer-payment journal entry is invalid')
   }
   if (value.state === 'pending') return value as PendingPeerPaymentAttempt
+  if (value.state === 'terminal') {
+    if (
+      typeof value.terminalAt !== 'number' ||
+      !Number.isSafeInteger(value.terminalAt) ||
+      value.terminalAt < 0 ||
+      value.terminalProofVersion !== 1 ||
+      typeof value.authorizationNonce !== 'string' ||
+      !/^0x[0-9a-f]{64}$/.test(value.authorizationNonce) ||
+      typeof value.validBefore !== 'string' ||
+      !/^[1-9][0-9]*$/.test(value.validBefore) ||
+      !Array.isArray(value.quorum) ||
+      value.quorum.length !== TERMINAL_RPC_QUORUM_SIZE
+    ) {
+      throw new Error('terminal peer-payment journal entry is invalid')
+    }
+    const quorum = value.quorum.map(
+      parseAuthorizationExpiryProof,
+    ) as TerminalPeerPaymentAttempt['quorum']
+    const validBefore = BigInt(value.validBefore)
+    if (
+      new Set(quorum.map((proof) => proof.rpcOriginHash)).size !== TERMINAL_RPC_QUORUM_SIZE ||
+      quorum.some((proof) => BigInt(proof.finalizedBlockTimestamp) < validBefore)
+    ) {
+      throw new Error('terminal peer-payment quorum proof contradicts the signed expiry')
+    }
+    return {
+      ...(value as unknown as TerminalPeerPaymentAttempt),
+      quorum,
+    }
+  }
   if (typeof value.settledAt !== 'number') {
     throw new Error('settled peer-payment journal entry is invalid')
   }
@@ -395,6 +542,14 @@ function parseAttempt(value: unknown): PeerPaymentAttempt {
     ...(value as unknown as SettledPeerPaymentAttempt),
     evidence: parseEvidence(value.evidence),
   }
+}
+
+function peerPaymentContents(attempt: PeerPaymentAttempt): string {
+  const contents = `${JSON.stringify(attempt)}\n`
+  if (Buffer.byteLength(contents, 'utf8') > MAX_PEER_PAYMENT_JOURNAL_BYTES) {
+    throw new Error('peer-payment journal entry exceeds its byte-size safety limit')
+  }
+  return contents
 }
 
 async function loadAttempt(path: string): Promise<PeerPaymentAttempt | undefined> {
@@ -408,6 +563,129 @@ async function loadAttempt(path: string): Promise<PeerPaymentAttempt | undefined
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     if (error instanceof SyntaxError) throw new Error('peer-payment journal contains invalid JSON')
     throw error
+  }
+}
+
+async function loadArchivedTerminalAttempt(
+  identityPath: string,
+  publicKey: string,
+  key: string,
+  expected?: Pick<PeerPaymentAttemptBase, 'paymentId' | 'headerName' | 'headerValue'>,
+): Promise<TerminalPeerPaymentAttempt | undefined> {
+  const directory = peerPaymentArchiveDirectory(identityPath, publicKey)
+  await ensurePrivateArchiveDirectory(identityPath, publicKey)
+  let names: string[]
+  try {
+    const directoryNames = await readdir(directory)
+    const archiveNames = directoryNames.filter((name) => name.endsWith('.json'))
+    if (archiveNames.length > MAX_PEER_PAYMENT_ENTRIES) {
+      throw new Error('terminal peer-payment archive exceeds its entry safety limit')
+    }
+    names = archiveNames.filter((name) =>
+      new RegExp(`^${key}\\.[0-9]+\\.[0-9a-f]{16}\\.json$`).test(name))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+  if (names.length === 0) return undefined
+  const matches: Array<{ name: string; attempt: TerminalPeerPaymentAttempt }> = []
+  for (const name of names.sort()) {
+    const raw = await readPrivateFile(
+      join(directory, name),
+      MAX_PEER_PAYMENT_JOURNAL_BYTES,
+      'archived peer-payment journal entry',
+    )
+    let parsed: PeerPaymentAttempt
+    try {
+      parsed = parseAttempt(JSON.parse(raw) as unknown)
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error('archived peer-payment journal contains invalid JSON')
+      }
+      throw error
+    }
+    if (
+      parsed.state !== 'terminal' ||
+      !name.endsWith(`.${parsed.terminalAt}.${sha256Hex(raw).slice(0, 16)}.json`)
+    ) {
+      throw new Error('archived peer-payment journal entry is inconsistent')
+    }
+    matches.push({ name, attempt: parsed })
+  }
+  const byAuthorization = new Map<string, number>()
+  for (const { attempt } of matches) {
+    const authorizationKey = sha256Hex([
+      attempt.paymentId,
+      attempt.headerName,
+      attempt.headerValue,
+    ].join('\n'))
+    byAuthorization.set(authorizationKey, (byAuthorization.get(authorizationKey) ?? 0) + 1)
+  }
+  if ([...byAuthorization.values()].some((count) => count > 1)) {
+    throw new Error('duplicate terminal archives exist for one peer-payment authorization')
+  }
+  const candidates = expected
+    ? matches.filter(({ attempt }) =>
+        attempt.paymentId === expected.paymentId &&
+        attempt.headerName === expected.headerName &&
+        attempt.headerValue === expected.headerValue)
+    : matches
+  candidates.sort((left, right) =>
+    right.attempt.terminalAt - left.attempt.terminalAt ||
+    right.name.localeCompare(left.name))
+  return candidates[0]?.attempt
+}
+
+async function stageTerminalPeerPaymentArchive(
+  identityPath: string,
+  publicKey: string,
+  key: string,
+  attempt: TerminalPeerPaymentAttempt,
+): Promise<void> {
+  await ensurePrivateArchiveDirectory(identityPath, publicKey)
+  const contents = peerPaymentContents(attempt)
+  const directory = peerPaymentArchiveDirectory(identityPath, publicKey)
+  const target = join(
+    directory,
+    `${key}.${attempt.terminalAt}.${sha256Hex(contents).slice(0, 16)}.json`,
+  )
+  await withFileLock(join(directory, '.entry-count'), async () => {
+    const existing = await loadArchivedTerminalAttempt(identityPath, publicKey, key, attempt)
+    if (existing) {
+      if (peerPaymentContents(existing) !== contents) {
+        throw new Error('terminal peer-payment archive conflicts with the exact journal')
+      }
+      return
+    }
+    const entries = (await readdir(directory)).filter((name) => name.endsWith('.json'))
+    if (entries.length >= MAX_PEER_PAYMENT_ENTRIES) {
+      throw new Error('terminal peer-payment archive reached its entry safety limit')
+    }
+    if (!await atomicCreatePrivate(target, contents)) {
+      const raced = await readPrivateFile(
+        target,
+        MAX_PEER_PAYMENT_JOURNAL_BYTES,
+        'archived peer-payment journal entry',
+      )
+      if (raced !== contents) {
+        throw new Error('terminal peer-payment archive conflicts with the exact journal')
+      }
+    }
+  })
+}
+
+async function removeAndSync(path: string): Promise<void> {
+  try {
+    await unlink(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  const directory = await open(dirname(path), 'r')
+  try {
+    await directory.sync()
+  } finally {
+    await directory.close()
   }
 }
 
@@ -518,7 +796,7 @@ async function validatePaymentHeader(
   payer: `0x${string}`,
   nowMilliseconds: number,
   requireFresh: boolean,
-): Promise<{ nonce: `0x${string}` }> {
+): Promise<{ nonce: `0x${string}`; validBefore: bigint }> {
   let payload: ReturnType<typeof decodePaymentSignatureHeader>
   try {
     payload = decodePaymentSignatureHeader(value)
@@ -604,7 +882,27 @@ async function validatePaymentHeader(
   if (recovered.toLowerCase() !== payer.toLowerCase()) {
     throw new Error('x402 EIP-3009 authorization signer does not match the local wallet')
   }
-  return { nonce: authorization.nonce.toLowerCase() as `0x${string}` }
+  return {
+    nonce: authorization.nonce.toLowerCase() as `0x${string}`,
+    validBefore,
+  }
+}
+
+function peerAuthorizationHash(
+  attempt: Pick<
+    PeerPaymentAttemptBase,
+    'publicKey' | 'wallet' | 'chainId' | 'headerName' | 'headerValue'
+  >,
+  nonce: `0x${string}`,
+): string {
+  return sha256Hex([
+    attempt.publicKey,
+    attempt.wallet.toLowerCase(),
+    String(attempt.chainId),
+    nonce.toLowerCase(),
+    attempt.headerName,
+    attempt.headerValue,
+  ].join('\n'))
 }
 
 async function cancelResponseBody(response: Response): Promise<void> {
@@ -687,6 +985,7 @@ export class PeerPaymentClient {
   readonly #fetcher: FetchLike
   readonly #rpcFetcher: FetchLike
   readonly #rpcUrl: string
+  readonly #terminalRpcUrls?: readonly [string, string, string]
   readonly #now: () => number
   readonly #identityPath: string
   readonly #boundIdentityChainId: number
@@ -774,6 +1073,24 @@ export class PeerPaymentClient {
     this.#rpcFetcher = options.rpcFetch ?? globalThis.fetch
     assertNoIdentitySecrets(options.rpcUrl, this.#identity, 'RPC URL')
     this.#rpcUrl = normalizeHttpsUrl(options.rpcUrl, 'RPC URL').href
+    if (options.quorumRpcUrls !== undefined) {
+      if (
+        !Array.isArray(options.quorumRpcUrls) ||
+        options.quorumRpcUrls.length !== TERMINAL_RPC_QUORUM_SIZE - 1
+      ) {
+        throw new Error('terminal clear requires exactly two independent quorum RPC URLs')
+      }
+      const urls = [this.#rpcUrl, ...options.quorumRpcUrls.map((value) => {
+        if (typeof value !== 'string') throw new Error('quorum RPC URL must be a string')
+        assertNoIdentitySecrets(value, this.#identity, 'quorum RPC URL')
+        return normalizeHttpsUrl(value, 'quorum RPC URL').href
+      })] as [string, string, string]
+      const origins = new Set(urls.map((value) => new URL(value).origin))
+      if (origins.size !== TERMINAL_RPC_QUORUM_SIZE) {
+        throw new Error('terminal clear requires three distinct RPC origins')
+      }
+      this.#terminalRpcUrls = Object.freeze(urls)
+    }
     this.#now = options.now ?? Date.now
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS
     if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs <= 0 || this.#timeoutMs > 120_000) {
@@ -820,7 +1137,260 @@ export class PeerPaymentClient {
         durablePaymentEvidenceMayExist = value
       })
     } catch (error) {
+      if (error instanceof TerminalPeerPaymentBlocked) throw error
       throw classifiedPeerPaymentError(error, durablePaymentEvidenceMayExist)
+    }
+  }
+
+  /** @internal Two-phase capability boundary; use clearTerminalPayment(). */
+  async stageTerminalPaymentClear(
+    input: PeerPaymentRequest,
+    control: McpPaymentControl,
+  ): Promise<never> {
+    const prepared = preparePeerPaymentRequest(input)
+    claimAuthorizedPaymentControl(
+      control,
+      'peer_pay',
+      spendInputFromPrepared(prepared),
+      prepared.amountAtomic,
+      spendPolicyScope(this.#identity.chainId, this.#identity.wallet),
+    )
+    const spendMetadata = claimedSpendControlMetadata(control)
+    try {
+      const terminalRpcUrls = this.#terminalRpcUrls
+      if (!terminalRpcUrls) {
+        throw new Error('terminal clear requires exactly two independent quorum RPC URLs')
+      }
+      const persisted = await loadIdentity(this.#identityPath)
+      if (!samePeerPaymentPrincipal(
+        persisted,
+        this.#identity,
+        this.#boundIdentityChainId,
+      )) {
+        throw new Error('peer-payment identity principal changed; reload before recovery')
+      }
+      const asset = expectedUsdc(this.#identity.chainId)
+      const target = new URL(prepared.url)
+      const key = logicalKey(
+        this.#identity,
+        target,
+        prepared.method,
+        prepared.body,
+        prepared.contentType,
+        prepared.amountAtomic,
+        prepared.payTo,
+        asset,
+      )
+      const journalPath = peerPaymentFile(this.#identityPath, this.#identity.publicKey, key)
+      const expected = expectedAttemptFromPrepared(this.#identity, prepared, asset)
+      await ensurePrivateJournalDirectories(this.#identityPath, this.#identity.publicKey)
+      return await withFileLock(journalPath, async () => {
+        const current = await loadAttempt(journalPath)
+        const archived = await loadArchivedTerminalAttempt(
+          this.#identityPath,
+          this.#identity.publicKey,
+          key,
+          current,
+        )
+        // A completed clear removes the active tombstone but deliberately keeps
+        // its immutable terminal archive. The spend guard's released row is
+        // only a same-day audit row and may already have been pruned, so an
+        // archive-only retry with history "none" is still the exact idempotent
+        // clear. In contrast, "uncertain" proves a newer spend generation was
+        // reserved; an older archive must never clear that missing generation.
+        if (!current && spendMetadata.reservationHistory === 'uncertain') {
+          throw new Error(
+            'active peer-payment journal is missing for the ambiguous spend generation',
+          )
+        }
+        if (current && archived && (
+          current.state !== 'terminal' ||
+          peerPaymentContents(current) !== peerPaymentContents(archived)
+        )) {
+          throw new Error('active peer-payment journal conflicts with its terminal archive')
+        }
+        const attempt = current ?? archived
+        if (!attempt) {
+          if (spendMetadata.reservationHistory === 'none') {
+            throw new Error(
+              'active peer-payment journal is missing for the ambiguous spend generation',
+            )
+          }
+          throw new Error('no retained peer-payment authorization exists for this exact request')
+        }
+        assertAttemptMatches(attempt, expected)
+        if (attempt.state === 'settled') {
+          throw new Error('a settled peer-payment authorization cannot be terminal-cleared')
+        }
+        const authorization = await validatePaymentHeader(
+          attempt.headerValue,
+          attempt.paymentId,
+          target,
+          this.#identity.chainId,
+          asset,
+          prepared.amountAtomic,
+          prepared.payTo,
+          this.#identity.wallet,
+          this.#now(),
+          false,
+        )
+        if (attempt.state === 'terminal' && (
+          attempt.authorizationNonce !== authorization.nonce ||
+          attempt.validBefore !== authorization.validBefore.toString()
+        )) {
+          throw new Error('terminal peer-payment journal contradicts its signed authorization')
+        }
+        const quorum = await proveExpiredUnusedAuthorizationQuorum({
+          rpcUrls: terminalRpcUrls,
+          chainId: this.#identity.chainId,
+          asset,
+          authorizer: this.#identity.wallet,
+          nonce: authorization.nonce,
+          validBefore: authorization.validBefore,
+          fetch: this.#rpcFetcher,
+          timeoutMs: this.#timeoutMs,
+        })
+        let terminal = attempt
+        if (attempt.state === 'pending') {
+          terminal = {
+            ...attempt,
+            state: 'terminal',
+            terminalAt: this.#now(),
+            terminalProofVersion: 1,
+            authorizationNonce: authorization.nonce,
+            validBefore: authorization.validBefore.toString(),
+            quorum,
+          }
+          await atomicWritePrivate(journalPath, peerPaymentContents(terminal))
+        }
+        if (terminal.state !== 'terminal') {
+          throw new Error('peer-payment authorization is not terminal')
+        }
+        await stageTerminalPeerPaymentArchive(
+          this.#identityPath,
+          this.#identity.publicKey,
+          key,
+          terminal,
+        )
+        throw terminalPaymentCleared({
+          spendControl: control,
+          spendReservationId: spendMetadata.reservationId,
+          spendAmountAtomic: prepared.amountAtomic.toString(),
+          publicKey: this.#identity.publicKey,
+          attemptKey: key,
+          paymentId: terminal.paymentId,
+          bodyHash: terminal.bodyHash,
+          authorizationHash: peerAuthorizationHash(terminal, authorization.nonce),
+        })
+      })
+    } catch (error) {
+      if (error instanceof TerminalPaymentCleared) throw error
+      // The exact retained authorization remains ambiguous unless and until
+      // the branded terminal-clear capability crosses the durable release.
+      throw classifiedPeerPaymentError(error, true)
+    }
+  }
+
+  /** @internal Two-phase capability boundary; use clearTerminalPayment(). */
+  async finalizeTerminalPaymentClear(
+    input: PeerPaymentRequest,
+    completion: TerminalPaymentCleared,
+  ): Promise<void> {
+    const prepared = preparePeerPaymentRequest(input)
+    const persisted = await loadIdentity(this.#identityPath)
+    if (!samePeerPaymentPrincipal(
+      persisted,
+      this.#identity,
+      this.#boundIdentityChainId,
+    )) {
+      throw new Error('peer-payment identity principal changed; reload before recovery')
+    }
+    const asset = expectedUsdc(this.#identity.chainId)
+    const target = new URL(prepared.url)
+    const key = logicalKey(
+      this.#identity,
+      target,
+      prepared.method,
+      prepared.body,
+      prepared.contentType,
+      prepared.amountAtomic,
+      prepared.payTo,
+      asset,
+    )
+    const journalPath = peerPaymentFile(this.#identityPath, this.#identity.publicKey, key)
+    const expected = expectedAttemptFromPrepared(this.#identity, prepared, asset)
+    await withFileLock(journalPath, async () => {
+      const current = await loadAttempt(journalPath)
+      const archived = await loadArchivedTerminalAttempt(
+        this.#identityPath,
+        this.#identity.publicKey,
+        key,
+        current,
+      )
+      if (!archived) throw new Error('terminal peer-payment archive is missing')
+      assertAttemptMatches(archived, expected)
+      if (current && (
+        current.state !== 'terminal' ||
+        peerPaymentContents(current) !== peerPaymentContents(archived)
+      )) {
+        throw new Error('active terminal peer-payment journal conflicts with its archive')
+      }
+      const authorization = await validatePaymentHeader(
+        archived.headerValue,
+        archived.paymentId,
+        target,
+        this.#identity.chainId,
+        asset,
+        prepared.amountAtomic,
+        prepared.payTo,
+        this.#identity.wallet,
+        this.#now(),
+        false,
+      )
+      if (
+        archived.authorizationNonce !== authorization.nonce ||
+        archived.validBefore !== authorization.validBefore.toString()
+      ) {
+        throw new Error('terminal peer-payment archive contradicts its signed authorization')
+      }
+      const binding = consumeTerminalPaymentClear(completion, {
+        publicKey: this.#identity.publicKey,
+        bodyHash: bodyHash(prepared.body),
+        attemptKeys: [key],
+        authorizationHashes: [peerAuthorizationHash(archived, authorization.nonce)],
+      })
+      if (binding.paymentId !== archived.paymentId) {
+        throw new Error('terminal-payment completion belongs to another authorization')
+      }
+      if (current) await removeAndSync(journalPath)
+    })
+  }
+
+  /**
+   * Clear one expired, unanimously unused peer authorization. The active
+   * tombstone is removed only after the exact shared spend reservation is
+   * durably released and an immutable private archive exists.
+   */
+  async clearTerminalPayment(
+    input: PeerPaymentRequest,
+    guard: McpSpendGuard,
+  ): Promise<PeerPaymentTerminalClearResult> {
+    if (!(guard instanceof McpSpendGuard)) {
+      throw new Error('terminal payment clear requires the official spend-policy guard')
+    }
+    const prepared = preparePeerPaymentRequest(input)
+    try {
+      await guard.execute(
+        'peer_pay',
+        spendInputFromPrepared(prepared),
+        prepared.amountAtomic,
+        (control) => this.stageTerminalPaymentClear(prepared, control),
+      )
+      throw new Error('terminal payment clear returned unexpectedly')
+    } catch (error) {
+      if (!(error instanceof TerminalPaymentCleared)) throw error
+      await this.finalizeTerminalPaymentClear(prepared, error)
+      return error.result
     }
   }
 
@@ -855,22 +1425,14 @@ export class PeerPaymentClient {
     await ensurePrivateJournalDirectories(this.#identityPath, this.#identity.publicKey)
 
     return withFileLock(journalPath, async () => {
-      const expected = {
-        publicKey: this.#identity.publicKey,
-        wallet: this.#identity.wallet,
-        chainId: this.#identity.chainId,
-        url: target.href,
-        method,
-        ...(contentType ? { contentType } : {}),
-        bodyHash: bodyHash(body),
-        amountAtomic: amountAtomic.toString(),
-        payTo,
-        asset,
-      }
+      const expected = expectedAttemptFromPrepared(this.#identity, input, asset)
       const existing = await loadAttempt(journalPath)
       if (existing) {
         assertAttemptMatches(existing, expected)
         if (existing.state === 'settled') return existing.evidence
+        if (existing.state === 'terminal') {
+          throw new TerminalPeerPaymentBlocked()
+        }
         await validatePaymentHeader(
           existing.headerValue,
           existing.paymentId,
@@ -960,6 +1522,9 @@ export class PeerPaymentClient {
           setDurablePaymentEvidenceMayExist(true)
           if (claimed.state === 'settled') {
             throw new Error('peer payment settled concurrently; repeat the command to read its evidence')
+          }
+          if (claimed.state === 'terminal') {
+            throw new TerminalPeerPaymentBlocked()
           }
           pending = claimed
           request = new Request(request, { redirect: 'manual' })
@@ -1216,6 +1781,81 @@ function assertRpcChain(value: unknown, expectedChainId: number): void {
   if (actual !== BigInt(expectedChainId)) {
     throw new Error(`RPC chain id does not match configured chain ${expectedChainId}`)
   }
+}
+
+type AuthorizationQuorumOptions = {
+  rpcUrls: readonly [string, string, string]
+  chainId: number
+  asset: `0x${string}`
+  authorizer: `0x${string}`
+  nonce: `0x${string}`
+  validBefore: bigint
+  fetch: FetchLike
+  timeoutMs: number
+}
+
+async function proveExpiredUnusedAuthorizationAtRpc(
+  options: Omit<AuthorizationQuorumOptions, 'rpcUrls'> & { rpcUrl: string },
+): Promise<PeerAuthorizationExpiryProof> {
+  const chain = await rpcCall(options, 'eth_chainId', [])
+  assertRpcChain(chain, options.chainId)
+  const finalized = await rpcCall(options, 'eth_getBlockByNumber', ['finalized', false])
+  if (!isRecord(finalized)) throw new Error('RPC finalized block was not found')
+  const blockNumber = parseHexInteger(finalized.number, 'finalized block number')
+  const blockTimestamp = parseHexInteger(finalized.timestamp, 'finalized block timestamp')
+  if (
+    typeof finalized.hash !== 'string' ||
+    !/^0x[0-9a-fA-F]{64}$/.test(finalized.hash)
+  ) {
+    throw new Error('RPC finalized block has no canonical hash')
+  }
+  if (blockTimestamp < options.validBefore) {
+    throw new Error('payment authorization has not expired at every finalized RPC head')
+  }
+  const data = encodeFunctionData({
+    abi: AUTHORIZATION_STATE_ABI,
+    functionName: 'authorizationState',
+    args: [options.authorizer, options.nonce],
+  })
+  const state = await rpcCall(
+    options,
+    'eth_call',
+    [{ to: options.asset, data }, {
+      blockHash: finalized.hash.toLowerCase(),
+      requireCanonical: true,
+    }],
+  )
+  if (typeof state !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(state)) {
+    throw new Error('RPC returned a non-canonical USDC authorization state')
+  }
+  if (BigInt(state) !== 0n) {
+    throw new Error('payment authorization is already used and cannot be terminal-cleared')
+  }
+  return {
+    rpcOriginHash: sha256Hex(new URL(options.rpcUrl).origin),
+    finalizedBlockNumber: blockNumber.toString(),
+    finalizedBlockHash: finalized.hash.toLowerCase() as `0x${string}`,
+    finalizedBlockTimestamp: blockTimestamp.toString(),
+    authorizationState: false,
+  }
+}
+
+async function proveExpiredUnusedAuthorizationQuorum(
+  options: AuthorizationQuorumOptions,
+): Promise<TerminalPeerPaymentAttempt['quorum']> {
+  const origins = options.rpcUrls.map((value) => normalizeHttpsUrl(value, 'RPC URL').origin)
+  if (new Set(origins).size !== TERMINAL_RPC_QUORUM_SIZE) {
+    throw new Error('terminal clear requires three distinct RPC origins')
+  }
+  const proofs = await Promise.all(options.rpcUrls.map((rpcUrl) =>
+    proveExpiredUnusedAuthorizationAtRpc({
+      ...options,
+      rpcUrl,
+    })))
+  if (proofs.length !== TERMINAL_RPC_QUORUM_SIZE) {
+    throw new Error('terminal clear did not obtain the required RPC quorum')
+  }
+  return proofs as TerminalPeerPaymentAttempt['quorum']
 }
 
 export async function readUsdcBalance(

@@ -38,6 +38,7 @@ import { assertNoIdentitySecrets } from './secret-safety.js'
 import { spendPolicyScope } from './spend-scope.js'
 import { usdcEip712Domain, type UsdcEip712Domain } from './usdc-domain.js'
 import {
+  claimedSpendControlMetadata,
   consumeTerminalPaymentClear,
   terminalPaymentCleared,
   TerminalPaymentCleared,
@@ -2924,6 +2925,7 @@ export class AgentApi {
       POST_FEE_ATOMIC,
       spendPolicyScope(this.#identityValue.chainId, this.#identityValue.wallet),
     )
+    const spendMetadata = claimedSpendControlMetadata(control)
     if (!this.#identityPath) {
       throw paymentFailure(
         new Error('job payment recovery requires a durable payment-recovery journal'),
@@ -2964,6 +2966,9 @@ export class AgentApi {
           )
         }
         throw terminalPaymentCleared({
+          spendControl: control,
+          spendReservationId: spendMetadata.reservationId,
+          spendAmountAtomic: POST_FEE_ATOMIC.toString(),
           publicKey: this.#identityValue.publicKey,
           attemptKey: recovered.attemptKey,
           paymentId: recovered.attempt.paymentId,
@@ -3103,6 +3108,7 @@ export class AgentApi {
       BID_FEE_ATOMIC,
       spendPolicyScope(this.#identityValue.chainId, this.#identityValue.wallet),
     )
+    const spendMetadata = claimedSpendControlMetadata(control)
     if (!this.#identityPath) {
       throw paymentFailure(
         new Error('bid payment recovery requires a durable payment-recovery journal'),
@@ -3146,6 +3152,9 @@ export class AgentApi {
           )
         }
         throw terminalPaymentCleared({
+          spendControl: control,
+          spendReservationId: spendMetadata.reservationId,
+          spendAmountAtomic: BID_FEE_ATOMIC.toString(),
           publicKey: this.#identityValue.publicKey,
           attemptKey: recovered.attemptKey,
           paymentId: recovered.attempt.paymentId,

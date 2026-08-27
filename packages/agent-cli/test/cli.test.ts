@@ -332,6 +332,9 @@ afterEach(async () => {
 describe('agent identity', () => {
   it('binds terminal-clear capabilities to one operation and a durable spend release', () => {
     const binding = {
+      spendControl: Object.freeze({}),
+      spendReservationId: 'd'.repeat(64),
+      spendAmountAtomic: '10000',
       publicKey: 'public-key',
       attemptKey: 'a'.repeat(64),
       paymentId: '1f4bc_abcdefghijklmnop',

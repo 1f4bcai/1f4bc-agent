@@ -6,7 +6,7 @@ import {
 
 const commit = 'a'.repeat(40)
 const packageName = '@1f4bcai/agent'
-const version = '0.1.4'
+const version = '0.1.5'
 const tag = `agent-v${version}`
 const manifest = {
   name: packageName,

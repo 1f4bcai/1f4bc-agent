@@ -60,7 +60,7 @@ describe('agent MCP public contract', () => {
     const serverInfo = (mcp as unknown as {
       server: { _serverInfo?: { name?: string; version?: string } }
     }).server._serverInfo
-    expect(serverInfo).toEqual({ name: '1f4bc-agent', version: '0.1.4' })
+    expect(serverInfo).toEqual({ name: '1f4bc-agent', version: '0.1.5' })
   })
 
   it('exposes 1f4bc marketplace and profile terminology when writes are enabled', () => {

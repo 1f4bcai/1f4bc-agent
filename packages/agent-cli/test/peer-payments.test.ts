@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import {
   chmod,
+  link,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -26,7 +28,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { privateKeyToAccount } from 'viem/accounts'
 import { runCli } from '../src/index.js'
 import { loadIdentity } from '../src/keys.js'
-import { McpSpendGuard } from '../src/mcp-payments.js'
+import { claimAuthorizedPaymentControl, McpSpendGuard } from '../src/mcp-payments.js'
 import { spendPolicyScope } from '../src/spend-scope.js'
 import {
   PeerPaymentClient,
@@ -42,6 +44,11 @@ const txHash = `0x${'ab'.repeat(32)}`
 const receiptBlockHash = `0x${'cd'.repeat(32)}`
 const payer = privateKeyToAccount(walletPrivateKey).address
 const rpcUrl = 'https://rpc.example/'
+const terminalRpcUrls = [
+  'https://rpc-a.example/private-primary',
+  'https://rpc-b.example/private-witness',
+  'https://rpc-c.example/private-witness',
+] as const
 const cleanup: string[] = []
 const authorizationUsedTopic =
   '0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5'
@@ -128,6 +135,52 @@ function finalizedTransferRpc(overrides: {
   }) as typeof fetch
 }
 
+function expiredUnusedQuorumRpc(
+  validBefore: bigint,
+  nonce: `0x${string}`,
+  overrides: { laggingOrigin?: string; usedOrigin?: string } = {},
+): typeof fetch {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init)
+    const rpc = JSON.parse(await request.text()) as { method: string; params?: unknown[] }
+    const origin = new URL(request.url).origin
+    const index = terminalRpcUrls.findIndex((value) => new URL(value).origin === origin)
+    if (index < 0) throw new Error('unexpected terminal RPC origin')
+    if (rpc.method === 'eth_chainId') {
+      return Response.json({ jsonrpc: '2.0', id: 1, result: '0x2105' })
+    }
+    const blockHash = `0x${String(index + 1).repeat(64)}`
+    if (rpc.method === 'eth_getBlockByNumber') {
+      expect(rpc.params).toEqual(['finalized', false])
+      const timestamp = origin === overrides.laggingOrigin ? validBefore - 1n : validBefore
+      return Response.json({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          number: `0x${(100 + index).toString(16)}`,
+          hash: blockHash,
+          timestamp: `0x${timestamp.toString(16)}`,
+        },
+      })
+    }
+    if (rpc.method !== 'eth_call') throw new Error(`unexpected RPC method ${rpc.method}`)
+    expect(rpc.params).toEqual([{
+      to: usdc,
+      data: `0xe94a0102${payer.slice(2).toLowerCase().padStart(64, '0')}${nonce.slice(2)}`,
+    }, {
+      blockHash,
+      requireCanonical: true,
+    }])
+    return Response.json({
+      jsonrpc: '2.0',
+      id: 1,
+      result: origin === overrides.usedOrigin
+        ? `0x${'0'.repeat(63)}1`
+        : `0x${'0'.repeat(64)}`,
+    })
+  }) as typeof fetch
+}
+
 async function identityPath(key: `0x${string}` = walletPrivateKey): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), '1f4bc-peer-payment-'))
   cleanup.push(directory)
@@ -159,6 +212,42 @@ async function guardedPay(
     input.amountAtomic,
     (control) => client.pay(input, control),
   )
+}
+
+async function createAmbiguousCliPeerPayment(
+  path: string,
+  target: string,
+  dailyPaymentLimitAtomic = '25000',
+): Promise<string> {
+  let header = ''
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init)
+    const payment = request.headers.get('PAYMENT-SIGNATURE')
+    if (!payment) {
+      return new Response(null, {
+        status: 402,
+        headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(challenge(target)) },
+      })
+    }
+    header = payment
+    throw new Error('connection lost after peer authorization')
+  }) as typeof fetch
+  await expect(runCli([
+    '--identity', path,
+    'pay', target,
+    '--amount-atomic', '25000',
+    '--pay-to', payTo,
+  ], {
+    env: {
+      F4BC_RPC_URL: terminalRpcUrls[0],
+      F4BC_MAX_PAYMENT_ATOMIC: '25000',
+      F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: dailyPaymentLimitAtomic,
+    },
+    fetch: fetcher,
+    stdout: { write: () => undefined },
+  })).rejects.toThrow(/connection lost after peer authorization/i)
+  expect(header.length).toBeGreaterThan(20)
+  return header
 }
 
 function challenge(
@@ -542,6 +631,589 @@ describe('arbitrary worker x402 payments', () => {
     expect(output).not.toContain('PAYMENT-SIGNATURE')
   })
 
+  it('terminal-clears only after three private RPC origins prove exact finalized expiry and non-use', async () => {
+    const path = await identityPath()
+    const target = 'https://worker.example/private-terminal?capability=do-not-log'
+    const header = await createAmbiguousCliPeerPayment(path, target)
+    const decoded = decodePaymentSignatureHeader(header)
+    const authorization = decoded.payload.authorization as {
+      nonce: `0x${string}`
+      validBefore: string
+    }
+    const rpcFetch = expiredUnusedQuorumRpc(BigInt(authorization.validBefore), authorization.nonce)
+    let output = ''
+    const env = {
+      F4BC_RPC_URL: terminalRpcUrls[0],
+      F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+      F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+      F4BC_MAX_PAYMENT_ATOMIC: '25000',
+      F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+    }
+    const argv = [
+      '--identity', path,
+      'recover', 'pay', target,
+      '--clear-terminal',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ]
+
+    await expect(runCli(argv, {
+      env,
+      rpcFetch,
+      stdout: { write: (chunk) => (output += chunk) },
+    })).resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
+    expect(rpcFetch).toHaveBeenCalledTimes(9)
+    expect(output).not.toContain(header)
+    expect(output).not.toContain(authorization.nonce)
+    expect(output).not.toContain('private-primary')
+    expect(output).not.toContain('private-witness')
+    expect(output).not.toContain('capability=do-not-log')
+
+    const root = join(dirname(path), 'peer-payment-attempts')
+    const [principal] = await readdir(root)
+    const principalDirectory = join(root, principal!)
+    expect((await readdir(principalDirectory)).filter((name) => /^[0-9a-f]{64}\.json$/.test(name)))
+      .toEqual([])
+    const archiveDirectory = join(principalDirectory, 'terminal-archive')
+    const archiveNames = (await readdir(archiveDirectory)).filter((name) => name.endsWith('.json'))
+    expect(archiveNames).toHaveLength(1)
+    const archivePath = join(archiveDirectory, archiveNames[0]!)
+    expect((await stat(archivePath)).mode & 0o777).toBe(0o600)
+    expect(await readFile(archivePath, 'utf8')).toContain(header)
+    const spendName = (await readdir(dirname(path))).find((name) =>
+      /^spend-[0-9a-f]{64}\.json$/.test(name))!
+    const spend = JSON.parse(await readFile(join(dirname(path), spendName), 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'released' })])
+
+    // A crash after active-tombstone removal remains idempotently recoverable
+    // from the immutable archive, but must repeat the three-provider proof.
+    await expect(runCli(argv, {
+      env,
+      rpcFetch,
+      stdout: { write: () => undefined },
+    })).resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
+    expect(rpcFetch).toHaveBeenCalledTimes(18)
+  })
+
+  it('replays an archive-only terminal clear after its released spend row crosses UTC', async () => {
+    const path = await identityPath()
+    const identity = await loadIdentity(path)
+    const target = 'https://worker.example/cross-utc-terminal-clear'
+    const input = {
+      url: target,
+      method: 'GET' as const,
+      amountAtomic: 25_000n,
+      payTo,
+    }
+    let header = ''
+    const firstClient = new PeerPaymentClient(identity, {
+      identityPath: path,
+      rpcUrl: terminalRpcUrls[0],
+      fetch: vi.fn(async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(requestInput, init)
+        const payment = request.headers.get('PAYMENT-SIGNATURE')
+        if (!payment) {
+          return new Response(null, {
+            status: 402,
+            headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(challenge(target)) },
+          })
+        }
+        header = payment
+        throw new Error('ambiguous before terminal clear')
+      }) as typeof fetch,
+    })
+    let spendNow = Date.UTC(2026, 7, 22, 23, 59)
+    const journalPath = join(dirname(path), 'cross-utc-spend.json')
+    const spendOptions = {
+      journalPath,
+      maxPaymentAtomic: input.amountAtomic,
+      dailyPaymentLimitAtomic: input.amountAtomic,
+      scope: spendPolicyScope(identity.chainId, identity.wallet),
+      now: () => spendNow,
+    }
+    await expect(new McpSpendGuard(spendOptions).execute(
+      'peer_pay',
+      peerPaymentSpendInput(input),
+      input.amountAtomic,
+      (control) => firstClient.pay(input, control),
+    )).rejects.toThrow(/ambiguous before terminal clear/i)
+
+    const authorization = decodePaymentSignatureHeader(header).payload.authorization as {
+      nonce: `0x${string}`
+      validBefore: string
+    }
+    const rpcFetch = expiredUnusedQuorumRpc(
+      BigInt(authorization.validBefore),
+      authorization.nonce,
+    )
+    const terminalClient = new PeerPaymentClient(identity, {
+      identityPath: path,
+      rpcUrl: terminalRpcUrls[0],
+      quorumRpcUrls: terminalRpcUrls.slice(1),
+      rpcFetch,
+    })
+    await expect(terminalClient.clearTerminalPayment(
+      input,
+      new McpSpendGuard(spendOptions),
+    )).resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
+
+    spendNow = Date.UTC(2026, 7, 23, 0, 1)
+    await expect(terminalClient.clearTerminalPayment(
+      input,
+      new McpSpendGuard(spendOptions),
+    )).resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
+    expect(rpcFetch).toHaveBeenCalledTimes(18)
+
+    const spend = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      entries: Array<{ state: string; day: string }>
+    }
+    expect(spend.entries).toEqual([
+      expect.objectContaining({ state: 'released', day: '2026-08-23' }),
+    ])
+    const [principal] = await readdir(join(dirname(path), 'peer-payment-attempts'))
+    const archives = (await readdir(join(
+      dirname(path),
+      'peer-payment-attempts',
+      principal!,
+      'terminal-archive',
+    ))).filter((name) => name.endsWith('.json'))
+    expect(archives).toHaveLength(1)
+
+    let newerHeader = ''
+    const newerClient = new PeerPaymentClient(identity, {
+      identityPath: path,
+      rpcUrl: terminalRpcUrls[0],
+      fetch: vi.fn(async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(requestInput, init)
+        const payment = request.headers.get('PAYMENT-SIGNATURE')
+        if (!payment) {
+          return new Response(null, {
+            status: 402,
+            headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(challenge(target)) },
+          })
+        }
+        newerHeader = payment
+        throw new Error('newer ambiguous generation')
+      }) as typeof fetch,
+    })
+    await expect(new McpSpendGuard(spendOptions).execute(
+      'peer_pay',
+      peerPaymentSpendInput(input),
+      input.amountAtomic,
+      (control) => newerClient.pay(input, control),
+    )).rejects.toThrow(/newer ambiguous generation/i)
+    expect(newerHeader).not.toBe(header)
+
+    const principalDirectory = join(dirname(path), 'peer-payment-attempts', principal!)
+    const [newerActive] = (await readdir(principalDirectory)).filter((name) =>
+      /^[0-9a-f]{64}\.json$/.test(name))
+    await rm(join(principalDirectory, newerActive!))
+    vi.mocked(rpcFetch).mockClear()
+    await expect(terminalClient.clearTerminalPayment(
+      input,
+      new McpSpendGuard(spendOptions),
+    )).rejects.toThrow(/missing.*ambiguous spend generation/i)
+    expect(rpcFetch).not.toHaveBeenCalled()
+
+    const finalSpend = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      entries: Array<{ state: string; day: string }>
+    }
+    expect(finalSpend.entries).toEqual([
+      expect.objectContaining({ state: 'ambiguous', day: '2026-08-23' }),
+    ])
+  })
+
+  it.each(['symlink', 'hardlink'] as const)(
+    'rejects an archived peer-payment %s before RPC proof',
+    async (kind) => {
+      const path = await identityPath()
+      const target = `https://worker.example/${kind}-archive-file`
+      const header = await createAmbiguousCliPeerPayment(path, target)
+      const authorization = decodePaymentSignatureHeader(header).payload.authorization as {
+        nonce: `0x${string}`
+        validBefore: string
+      }
+      const env = {
+        F4BC_RPC_URL: terminalRpcUrls[0],
+        F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+        F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+        F4BC_MAX_PAYMENT_ATOMIC: '25000',
+        F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+      }
+      const argv = [
+        '--identity', path,
+        'recover', 'pay', target,
+        '--clear-terminal',
+        '--amount-atomic', '25000',
+        '--pay-to', payTo,
+      ]
+      await runCli(argv, {
+        env,
+        rpcFetch: expiredUnusedQuorumRpc(
+          BigInt(authorization.validBefore),
+          authorization.nonce,
+        ),
+        stdout: { write: () => undefined },
+      })
+      const [principal] = await readdir(join(dirname(path), 'peer-payment-attempts'))
+      const archiveDirectory = join(
+        dirname(path), 'peer-payment-attempts', principal!, 'terminal-archive',
+      )
+      const [archiveName] = (await readdir(archiveDirectory)).filter((name) => name.endsWith('.json'))
+      const archivePath = join(archiveDirectory, archiveName!)
+      await rm(archivePath)
+      if (kind === 'symlink') {
+        await symlink(path, archivePath)
+      } else {
+        const decoy = join(dirname(path), 'archive-hardlink-decoy.json')
+        await writeFile(decoy, '{}\n', { mode: 0o600 })
+        await link(decoy, archivePath)
+      }
+      const rpcFetch = vi.fn(async () => {
+        throw new Error('RPC must not be reached for an unsafe archive file')
+      }) as typeof fetch
+
+      await expect(runCli(argv, {
+        env,
+        rpcFetch,
+        stdout: { write: () => undefined },
+      })).rejects.toThrow(/single-link regular file/i)
+      expect(rpcFetch).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    ['one finalized head is before validBefore', { laggingOrigin: new URL(terminalRpcUrls[1]).origin }],
+    ['one provider reports authorizationState=true', { usedOrigin: new URL(terminalRpcUrls[2]).origin }],
+  ] as const)('keeps the exact spend ambiguous when %s', async (_label, override) => {
+    const path = await identityPath()
+    const target = 'https://worker.example/terminal-fail-closed'
+    const header = await createAmbiguousCliPeerPayment(path, target)
+    const authorization = decodePaymentSignatureHeader(header).payload.authorization as {
+      nonce: `0x${string}`
+      validBefore: string
+    }
+    const rpcFetch = expiredUnusedQuorumRpc(
+      BigInt(authorization.validBefore),
+      authorization.nonce,
+      override,
+    )
+
+    await expect(runCli([
+      '--identity', path,
+      'recover', 'pay', target,
+      '--clear-terminal',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ], {
+      env: {
+        F4BC_RPC_URL: terminalRpcUrls[0],
+        F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+        F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+        F4BC_MAX_PAYMENT_ATOMIC: '25000',
+        F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+      },
+      rpcFetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/not expired|already used/i)
+
+    const spendName = (await readdir(dirname(path))).find((name) =>
+      /^spend-[0-9a-f]{64}\.json$/.test(name))!
+    const spend = JSON.parse(await readFile(join(dirname(path), spendName), 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+    const [principal] = await readdir(join(dirname(path), 'peer-payment-attempts'))
+    const entries = await readdir(join(dirname(path), 'peer-payment-attempts', principal!))
+    expect(entries.filter((name) => /^[0-9a-f]{64}\.json$/.test(name))).toHaveLength(1)
+    expect((await readdir(join(
+      dirname(path),
+      'peer-payment-attempts',
+      principal!,
+      'terminal-archive',
+    ))).filter((name) => name.endsWith('.json'))).toEqual([])
+  })
+
+  it.each(['missing', 'corrupt'] as const)(
+    'fails closed without RPC or spend release when the active peer journal is %s',
+    async (kind) => {
+      const path = await identityPath()
+      const target = 'https://worker.example/missing-generation'
+      await createAmbiguousCliPeerPayment(path, target)
+      const root = join(dirname(path), 'peer-payment-attempts')
+      const [principal] = await readdir(root)
+      const directory = join(root, principal!)
+      const [entry] = (await readdir(directory)).filter((name) => /^[0-9a-f]{64}\.json$/.test(name))
+      const active = join(directory, entry!)
+      if (kind === 'missing') await rm(active)
+      else await writeFile(active, '{', { mode: 0o600 })
+      const rpcFetch = vi.fn(async () => {
+        throw new Error('RPC must not be reached')
+      }) as typeof fetch
+
+      await expect(runCli([
+        '--identity', path,
+        'recover', 'pay', target,
+        '--clear-terminal',
+        '--amount-atomic', '25000',
+        '--pay-to', payTo,
+      ], {
+        env: {
+          F4BC_RPC_URL: terminalRpcUrls[0],
+          F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+          F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+          F4BC_MAX_PAYMENT_ATOMIC: '25000',
+          F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+        },
+        rpcFetch,
+        stdout: { write: () => undefined },
+      })).rejects.toThrow(/missing.*ambiguous spend generation|invalid JSON/i)
+      expect(rpcFetch).not.toHaveBeenCalled()
+      const spendName = (await readdir(dirname(path))).find((name) =>
+        /^spend-[0-9a-f]{64}\.json$/.test(name))!
+      const spend = JSON.parse(await readFile(join(dirname(path), spendName), 'utf8')) as {
+        entries: Array<{ state: string }>
+      }
+      expect(spend.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+    },
+  )
+
+  it('rejects a symlinked terminal archive directory before RPC or journal mutation', async () => {
+    const path = await identityPath()
+    const target = 'https://worker.example/symlinked-archive'
+    await createAmbiguousCliPeerPayment(path, target)
+    const root = join(dirname(path), 'peer-payment-attempts')
+    const [principal] = await readdir(root)
+    await symlink(path, join(root, principal!, 'terminal-archive'))
+    const rpcFetch = vi.fn(async () => {
+      throw new Error('RPC must not be reached')
+    }) as typeof fetch
+
+    await expect(runCli([
+      '--identity', path,
+      'recover', 'pay', target,
+      '--clear-terminal',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ], {
+      env: {
+        F4BC_RPC_URL: terminalRpcUrls[0],
+        F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+        F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+        F4BC_MAX_PAYMENT_ATOMIC: '25000',
+        F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+      },
+      rpcFetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/journal directory must be a real directory/i)
+    expect(rpcFetch).not.toHaveBeenCalled()
+    const [activeName] = (await readdir(join(root, principal!))).filter((name) =>
+      /^[0-9a-f]{64}\.json$/.test(name))
+    const active = JSON.parse(await readFile(join(root, principal!, activeName!), 'utf8')) as {
+      state: string
+    }
+    expect(active.state).toBe('pending')
+  })
+
+  it('does not let an old archive clear a newer missing authorization generation', async () => {
+    const path = await identityPath()
+    const target = 'https://worker.example/repeated-exact-request'
+    const firstHeader = await createAmbiguousCliPeerPayment(path, target)
+    const firstAuthorization = decodePaymentSignatureHeader(firstHeader).payload.authorization as {
+      nonce: `0x${string}`
+      validBefore: string
+    }
+    const argv = [
+      '--identity', path,
+      'recover', 'pay', target,
+      '--clear-terminal',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ]
+    const env = {
+      F4BC_RPC_URL: terminalRpcUrls[0],
+      F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+      F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+      F4BC_MAX_PAYMENT_ATOMIC: '25000',
+      F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+    }
+    await runCli(argv, {
+      env,
+      rpcFetch: expiredUnusedQuorumRpc(
+        BigInt(firstAuthorization.validBefore),
+        firstAuthorization.nonce,
+      ),
+      stdout: { write: () => undefined },
+    })
+
+    const secondHeader = await createAmbiguousCliPeerPayment(path, target)
+    expect(secondHeader).not.toBe(firstHeader)
+    const root = join(dirname(path), 'peer-payment-attempts')
+    const [principal] = await readdir(root)
+    const directory = join(root, principal!)
+    const [activeName] = (await readdir(directory)).filter((name) =>
+      /^[0-9a-f]{64}\.json$/.test(name))
+    await rm(join(directory, activeName!))
+    const rpcFetch = vi.fn(async () => {
+      throw new Error('old archive must not reach RPC proof')
+    }) as typeof fetch
+
+    await expect(runCli(argv, {
+      env,
+      rpcFetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/missing.*ambiguous spend generation/i)
+    expect(rpcFetch).not.toHaveBeenCalled()
+    const archiveNames = (await readdir(join(directory, 'terminal-archive')))
+      .filter((name) => name.endsWith('.json'))
+    expect(archiveNames).toHaveLength(1)
+    const spendName = (await readdir(dirname(path))).find((name) =>
+      /^spend-[0-9a-f]{64}\.json$/.test(name))!
+    const spend = JSON.parse(await readFile(join(dirname(path), spendName), 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+  })
+
+  it('keeps distinct immutable archives for repeated exact requests', async () => {
+    const path = await identityPath()
+    const target = 'https://worker.example/multiple-generations'
+    const env = {
+      F4BC_RPC_URL: terminalRpcUrls[0],
+      F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+      F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+      F4BC_MAX_PAYMENT_ATOMIC: '25000',
+      F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+    }
+    const argv = [
+      '--identity', path,
+      'recover', 'pay', target,
+      '--clear-terminal',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ]
+    const headers: string[] = []
+    for (let generation = 0; generation < 2; generation += 1) {
+      const header = await createAmbiguousCliPeerPayment(path, target)
+      headers.push(header)
+      const authorization = decodePaymentSignatureHeader(header).payload.authorization as {
+        nonce: `0x${string}`
+        validBefore: string
+      }
+      await runCli(argv, {
+        env,
+        rpcFetch: expiredUnusedQuorumRpc(
+          BigInt(authorization.validBefore),
+          authorization.nonce,
+        ),
+        stdout: { write: () => undefined },
+      })
+    }
+    expect(headers[1]).not.toBe(headers[0])
+    const [principal] = await readdir(join(dirname(path), 'peer-payment-attempts'))
+    const archiveDirectory = join(
+      dirname(path),
+      'peer-payment-attempts',
+      principal!,
+      'terminal-archive',
+    )
+    const archives = (await readdir(archiveDirectory)).filter((name) => name.endsWith('.json'))
+    expect(archives).toHaveLength(2)
+    const contents = await Promise.all(archives.map((name) =>
+      readFile(join(archiveDirectory, name), 'utf8')))
+    expect(contents.some((value) => value.includes(headers[0]!))).toBe(true)
+    expect(contents.some((value) => value.includes(headers[1]!))).toBe(true)
+  })
+
+  it('serializes concurrent distinct-key archives at the global entry ceiling', async () => {
+    const path = await identityPath()
+    const targets = [
+      'https://worker.example/archive-cap-a',
+      'https://worker.example/archive-cap-b',
+    ] as const
+    const headers = await Promise.all(targets.map((target) =>
+      createAmbiguousCliPeerPayment(path, target, '50000')))
+    const authorizations = headers.map((header) =>
+      decodePaymentSignatureHeader(header).payload.authorization as {
+        nonce: `0x${string}`
+        validBefore: string
+      })
+    const root = join(dirname(path), 'peer-payment-attempts')
+    const [principal] = await readdir(root)
+    const archiveDirectory = join(root, principal!, 'terminal-archive')
+    await mkdir(archiveDirectory, { mode: 0o700 })
+    const dummyNames = Array.from({ length: 4_095 }, (_, index) =>
+      join(archiveDirectory, `dummy-${index.toString().padStart(4, '0')}.json`))
+    for (let offset = 0; offset < dummyNames.length; offset += 128) {
+      await Promise.all(dummyNames.slice(offset, offset + 128).map((name) =>
+        writeFile(name, '{}\n', { mode: 0o600 })))
+    }
+    const env = {
+      F4BC_RPC_URL: terminalRpcUrls[0],
+      F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+      F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+      F4BC_MAX_PAYMENT_ATOMIC: '25000',
+      F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '50000',
+    }
+    const outcomes = await Promise.allSettled(targets.map((target, index) => runCli([
+      '--identity', path,
+      'recover', 'pay', target,
+      '--clear-terminal',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ], {
+      env,
+      rpcFetch: expiredUnusedQuorumRpc(
+        BigInt(authorizations[index]!.validBefore),
+        authorizations[index]!.nonce,
+      ),
+      stdout: { write: () => undefined },
+    })))
+
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected') as PromiseRejectedResult
+    expect(String(rejected.reason)).toMatch(/archive reached its entry safety limit/i)
+    expect((await readdir(archiveDirectory)).filter((name) => name.endsWith('.json')))
+      .toHaveLength(4_096)
+    const spendName = (await readdir(dirname(path))).find((name) =>
+      /^spend-[0-9a-f]{64}\.json$/.test(name))!
+    const spend = JSON.parse(await readFile(join(dirname(path), spendName), 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries.map((entry) => entry.state).sort()).toEqual(['ambiguous', 'released'])
+  })
+
+  it('requires explicit terminal-clear intent, caps, and three RPC origins', async () => {
+    const path = await identityPath()
+    const base = [
+      '--identity', path,
+      'recover', 'pay', 'https://worker.example/intent',
+      '--amount-atomic', '25000',
+      '--pay-to', payTo,
+    ]
+    await expect(runCli(base, { env: {}, stdout: { write: () => undefined } }))
+      .rejects.toThrow(/requires.*--clear-terminal/i)
+    await expect(runCli([...base, '--clear-terminal'], {
+      env: {
+        F4BC_RPC_URL: terminalRpcUrls[0],
+        F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+        F4BC_QUORUM_RPC_URL_2: terminalRpcUrls[2],
+      },
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/max-payment-atomic/i)
+    await expect(runCli([...base, '--clear-terminal'], {
+      env: {
+        F4BC_RPC_URL: terminalRpcUrls[0],
+        F4BC_QUORUM_RPC_URL_1: terminalRpcUrls[1],
+        F4BC_MAX_PAYMENT_ATOMIC: '25000',
+        F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '25000',
+      },
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/exactly two.*RPC/i)
+  })
+
   it('applies a global chain override to both peer authorization and its spend namespace', async () => {
     const path = await identityPath()
     const identity = await loadIdentity(path)
@@ -892,6 +1564,102 @@ describe('arbitrary worker x402 payments', () => {
     expect(secondRequests).toHaveLength(1)
     expect(secondRequests[0]!.headers.get('PAYMENT-SIGNATURE')).toBe(firstHeader)
     expect(result.transaction).toBe(txHash)
+  })
+
+  it('keeps terminal retry classification generation-aware across the clear boundary', async () => {
+    const path = await identityPath()
+    const identity = await loadIdentity(path)
+    const target = 'https://worker.example/terminal-clear-race'
+    const input = {
+      url: target,
+      method: 'GET' as const,
+      amountAtomic: 25_000n,
+      payTo,
+    }
+    let header = ''
+    const first = new PeerPaymentClient(identity, {
+      identityPath: path,
+      rpcUrl: terminalRpcUrls[0],
+      fetch: vi.fn(async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(requestInput, init)
+        const payment = request.headers.get('PAYMENT-SIGNATURE')
+        if (!payment) {
+          return new Response(null, {
+            status: 402,
+            headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(challenge(target)) },
+          })
+        }
+        header = payment
+        throw new Error('ambiguous first generation')
+      }) as typeof fetch,
+    })
+    await expect(guardedPay(path, first, input)).rejects.toThrow(/ambiguous first generation/i)
+    const authorization = decodePaymentSignatureHeader(header).payload.authorization as {
+      nonce: `0x${string}`
+      validBefore: string
+    }
+    const terminalClient = new PeerPaymentClient(identity, {
+      identityPath: path,
+      rpcUrl: terminalRpcUrls[0],
+      quorumRpcUrls: terminalRpcUrls.slice(1),
+      rpcFetch: expiredUnusedQuorumRpc(
+        BigInt(authorization.validBefore),
+        authorization.nonce,
+      ),
+    })
+    const journalPath = join(dirname(path), 'test-global-spend.json')
+    const guard = new McpSpendGuard({
+      journalPath,
+      maxPaymentAtomic: input.amountAtomic,
+      dailyPaymentLimitAtomic: input.amountAtomic * 10n,
+      scope: spendPolicyScope(identity.chainId, identity.wallet),
+    })
+    await expect(guard.execute(
+      'peer_pay',
+      peerPaymentSpendInput(input),
+      input.amountAtomic,
+      (control) => terminalClient.stageTerminalPaymentClear(input, control),
+    )).rejects.toMatchObject({ name: 'TerminalPaymentCleared' })
+    let spend = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'released' })])
+
+    const workerFetch = vi.fn(async () => {
+      throw new Error('terminal authorization must not be sent')
+    }) as typeof fetch
+    const blocked = new PeerPaymentClient(identity, {
+      identityPath: path,
+      rpcUrl: terminalRpcUrls[0],
+      fetch: workerFetch,
+    })
+    await expect(guardedPay(path, blocked, input)).rejects.toThrow(/authorization is terminal/i)
+    expect(workerFetch).not.toHaveBeenCalled()
+    spend = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'released' })])
+
+    await expect(guard.execute(
+      'peer_pay',
+      peerPaymentSpendInput(input),
+      input.amountAtomic,
+      async (control) => {
+        claimAuthorizedPaymentControl(
+          control,
+          'peer_pay',
+          peerPaymentSpendInput(input),
+          input.amountAtomic,
+          spendPolicyScope(identity.chainId, identity.wallet),
+        )
+        throw new Error('new ambiguity while tombstone is retained')
+      },
+    )).rejects.toThrow(/new ambiguity/i)
+    await expect(guardedPay(path, blocked, input)).rejects.toThrow(/authorization is terminal/i)
+    spend = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
   })
 
   it.each(['corrupt', 'oversized', 'symlink'] as const)(

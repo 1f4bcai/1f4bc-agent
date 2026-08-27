@@ -10,6 +10,10 @@ import {
   assertAuthorizedPaymentControl,
   claimAuthorizedPaymentControl,
 } from '../src/mcp-payments.js'
+import {
+  claimedSpendControlMetadata,
+  terminalPaymentCleared,
+} from '../src/terminal-clear.js'
 
 const cleanup: string[] = []
 
@@ -34,6 +38,79 @@ afterEach(async () => {
 })
 
 describe('MCP spend guard', () => {
+  it('retains prior ambiguity until the exact current-control terminal capability releases it', async () => {
+    const path = await journalPath()
+    const scope = 'test-wallet'
+    const tool = 'peer_pay'
+    const input = { url: 'https://worker.example/exact', bodySha256: 'a'.repeat(64) }
+    const amount = 25_000n
+    const guard = new McpSpendGuard({
+      journalPath: path,
+      scope,
+      maxPaymentAtomic: amount,
+      dailyPaymentLimitAtomic: amount,
+    })
+
+    await expect(guard.execute(tool, input, amount, async (control) => {
+      consume(control, tool, input, amount, scope)
+      throw new Error('authorization outcome is ambiguous')
+    })).rejects.toThrow(/ambiguous/i)
+
+    await expect(guard.execute(tool, input, amount, async () => {
+      throw Object.assign(new Error('pre-claim mismatch'), { paymentMayHaveOccurred: false })
+    })).rejects.toThrow(/pre-claim mismatch/i)
+    await expect(guard.execute(tool, input, amount, async (control) => {
+      consume(control, tool, input, amount, scope)
+      throw Object.assign(new Error('downstream false marker'), {
+        paymentMayHaveOccurred: false,
+      })
+    })).rejects.toThrow(/downstream false marker/i)
+    let journal = JSON.parse(await readFile(path, 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(journal.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+    await expect(guard.execute(tool, { url: 'https://worker.example/other' }, amount, async () => {
+      throw new Error('must not run')
+    })).rejects.toThrow(/daily cap/i)
+
+    let completion: ReturnType<typeof terminalPaymentCleared> | undefined
+    let observed: unknown
+    try {
+      await guard.execute(tool, input, amount, async (control) => {
+        consume(control, tool, input, amount, scope)
+        completion = terminalPaymentCleared({
+          spendControl: control,
+          spendReservationId: claimedSpendControlMetadata(control).reservationId,
+          spendAmountAtomic: amount.toString(),
+          publicKey: 'test-public-key',
+          attemptKey: 'b'.repeat(64),
+          paymentId: '1f4bc_peer_test',
+          bodyHash: 'a'.repeat(64),
+        })
+        throw completion
+      })
+    } catch (error) {
+      observed = error
+    }
+    expect(observed).toBe(completion)
+    journal = JSON.parse(await readFile(path, 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(journal.entries).toEqual([expect.objectContaining({ state: 'released' })])
+
+    await expect(guard.execute(tool, input, amount, async (control) => {
+      consume(control, tool, input, amount, scope)
+      throw new Error('new authorization B is ambiguous')
+    })).rejects.toThrow(/authorization B/i)
+    await expect(guard.execute(tool, input, amount, async () => {
+      throw completion
+    })).rejects.toBe(completion)
+    journal = JSON.parse(await readFile(path, 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(journal.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+  })
+
   it('refuses symlinked and oversized spend journals before executing a paid action', async () => {
     const linkedPath = await journalPath()
     const linkedTarget = `${linkedPath}.target`

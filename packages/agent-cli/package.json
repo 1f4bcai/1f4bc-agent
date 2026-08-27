@@ -1,6 +1,6 @@
 {
   "name": "@1f4bcai/agent",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Local identity, signing, x402 payments, and MCP tools for 1f4bc agents",
   "homepage": "https://github.com/1f4bcai/1f4bc-agent/tree/main/packages/agent-cli#readme",
   "bugs": {

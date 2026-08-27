@@ -1,6 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { atomicWritePrivate, readPrivateFile, withFileLock } from './local-journal.js'
-import { markTerminalPaymentClearReleased } from './terminal-clear.js'
+import {
+  forgetSpendControl,
+  isTerminalPaymentClearFor,
+  markSpendControlClaimed,
+  markTerminalPaymentClearReleased,
+  registerSpendControl,
+  TerminalPaymentCleared,
+} from './terminal-clear.js'
 
 export const MAX_MCP_SPEND_JOURNAL_ENTRIES = 4_096
 export const MAX_MCP_SPEND_JOURNAL_BYTES = 8 * 1_024 * 1_024
@@ -74,7 +81,12 @@ type SpendJournal = {
 
 type Reservation =
   | { cached: true; result: unknown }
-  | { cached: false; id: string; ownerToken: string }
+  | {
+      cached: false
+      id: string
+      ownerToken: string
+      reservationHistory: 'none' | 'released' | 'uncertain'
+    }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -242,6 +254,7 @@ export function claimAuthorizedPaymentControl<T>(
   // JavaScript executes this transition synchronously, so concurrent callers
   // cannot both consume the same control before either reaches its first await.
   issued.state = 'claimed'
+  markSpendControlClaimed(control)
   return issued.snapshot as T
 }
 
@@ -319,6 +332,10 @@ export class McpSpendGuard {
       scope: this.scope,
       state: 'issued',
     })
+    registerSpendControl(control, {
+      reservationId: id,
+      reservationHistory: reservation.reservationHistory,
+    })
     let result: T
     let finalControl: IssuedPaymentControl | undefined
     try {
@@ -331,7 +348,17 @@ export class McpSpendGuard {
       }
     } catch (error) {
       const issued = issuedPaymentControls.get(control)
-      const targetState = issued?.state !== 'claimed' || paymentMayHaveOccurred(error) === false
+      const exactTerminalClear = isTerminalPaymentClearFor(error, {
+        spendControl: control,
+        spendReservationId: id,
+        spendAmountAtomic: amountAtomic.toString(),
+      })
+      const targetState = exactTerminalClear || (
+        !(error instanceof TerminalPaymentCleared) &&
+        reservation.reservationHistory !== 'uncertain' && (
+          issued?.state !== 'claimed' || paymentMayHaveOccurred(error) === false
+        )
+      )
           ? 'released'
           : 'ambiguous'
       const transitioned = await this.transition(
@@ -346,6 +373,7 @@ export class McpSpendGuard {
       throw error
     } finally {
       issuedPaymentControls.delete(control)
+      forgetSpendControl(control)
     }
 
     try {
@@ -447,7 +475,7 @@ export class McpSpendGuard {
         existing.ownerToken = ownerToken
         existing.leaseAt = timestamp
         await this.save(journal)
-        return { cached: false, id, ownerToken }
+        return { cached: false, id, ownerToken, reservationHistory: 'uncertain' }
       }
 
       const used = journal.entries
@@ -465,6 +493,7 @@ export class McpSpendGuard {
           `MCP spend journal reached its ${MAX_MCP_SPEND_JOURNAL_ENTRIES}-entry safety limit`,
         )
       }
+      const reservationHistory = existing?.state === 'released' ? 'released' : 'none'
       if (existing) {
         Object.assign(existing, {
           amountAtomic: amountAtomic.toString(),
@@ -493,7 +522,12 @@ export class McpSpendGuard {
         })
       }
       await this.save(journal)
-      return { cached: false, id, ownerToken }
+      return {
+        cached: false,
+        id,
+        ownerToken,
+        reservationHistory,
+      }
     })
   }
 

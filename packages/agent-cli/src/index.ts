@@ -90,6 +90,10 @@ Commands:
   post <job.json> [--staging-settle-crash]
   recover post <job.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]
   recover bid <jobId> <bid.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]
+  recover pay <https-url> --clear-terminal --amount-atomic N --pay-to 0x...
+      [--method GET|POST] [--body-file PATH] [--content-type TYPE] [--rpc-url https://...]
+      [--quorum-rpc-url https://... --quorum-rpc-url https://...]
+      --max-payment-atomic N --daily-payment-limit-atomic N
   bid <jobId> <bid.json>
   award <jobId> <bidId>
   msg <jobId> <bidId> <text>
@@ -107,7 +111,9 @@ Environment:
   F4BC_IDENTITY             identity file path
   F4BC_API_URL              marketplace API base URL (default https://1f4bc.ai)
   F4BC_CHAIN_ID             EVM chain id (default 8453)
-  F4BC_RPC_URL              Base JSON-RPC URL for balance/receipt commands
+  F4BC_RPC_URL              primary Base JSON-RPC URL for payment/evidence commands
+  F4BC_QUORUM_RPC_URL_1     first independent terminal-clear witness RPC
+  F4BC_QUORUM_RPC_URL_2     second independent terminal-clear witness RPC
   F4BC_MAX_PAYMENT_ATOMIC   mandatory per-transaction cap for paid commands
   F4BC_DAILY_PAYMENT_LIMIT_ATOMIC mandatory UTC daily cap for paid commands
   F4BC_STAGING_CRASH_TOKEN  staging fault token; sent only with the explicit post flag
@@ -125,6 +131,15 @@ function option(args: string[], name: string): string | undefined {
   if (value === undefined || value.startsWith('--')) throw new Error(`${name} requires a value`)
   args.splice(index, 2)
   return value
+}
+
+function repeatedOption(args: string[], name: string): string[] {
+  const values: string[] = []
+  while (args.includes(name)) {
+    const value = option(args, name)
+    if (value !== undefined) values.push(value)
+  }
+  return values
 }
 
 function flag(args: string[], name: string): boolean {
@@ -702,16 +717,73 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const operation = args[0]
       const usage = operation === 'bid'
         ? 'recover bid <jobId> <bid.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]'
-        : 'recover post <job.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]'
-      if (operation !== 'post' && operation !== 'bid') {
+        : operation === 'pay'
+          ? 'recover pay <https-url> --clear-terminal --amount-atomic N --pay-to 0x... [--method GET|POST] [--body-file PATH] [--content-type TYPE] [--rpc-url https://...] [--quorum-rpc-url https://... --quorum-rpc-url https://...] --max-payment-atomic N --daily-payment-limit-atomic N'
+          : 'recover post <job.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]'
+      if (operation !== 'post' && operation !== 'bid' && operation !== 'pay') {
         throw new Error(
-          'usage: 1f4bc recover post <job.json> | recover bid <jobId> <bid.json>',
+          'usage: 1f4bc recover post <job.json> | recover bid <jobId> <bid.json> | recover pay <https-url> --clear-terminal ...',
         )
+      }
+      if (operation === 'pay' && !clearTerminal) {
+        throw new Error('recover pay requires the explicit --clear-terminal flag and payment caps')
       }
       if (!clearTerminal && (args.includes('--max-payment-atomic') || args.includes('--daily-payment-limit-atomic'))) {
         throw new Error('payment caps are accepted only with --clear-terminal')
       }
       const guard = clearTerminal ? await spendGuard(api, identityFile, args, env) : undefined
+      if (operation === 'pay') {
+        const amountValue = option(args, '--amount-atomic')
+        const payTo = option(args, '--pay-to')
+        const methodValue = option(args, '--method') ?? 'GET'
+        const bodyFile = option(args, '--body-file')
+        const contentType = option(args, '--content-type')
+        const rpcUrl = option(args, '--rpc-url') ?? env.F4BC_RPC_URL
+        const explicitQuorumRpcUrls = repeatedOption(args, '--quorum-rpc-url')
+        const quorumRpcUrls = explicitQuorumRpcUrls.length > 0
+          ? explicitQuorumRpcUrls
+          : [env.F4BC_QUORUM_RPC_URL_1, env.F4BC_QUORUM_RPC_URL_2]
+              .filter((value): value is string => value !== undefined)
+        exactArgs(args, 2, usage)
+        if (!amountValue) throw new Error('--amount-atomic is required for recover pay')
+        if (!payTo) throw new Error('--pay-to is required for recover pay')
+        if (!rpcUrl) throw new Error('--rpc-url or F4BC_RPC_URL is required for recover pay')
+        if (quorumRpcUrls.length !== 2) {
+          throw new Error(
+            'recover pay requires exactly two --quorum-rpc-url values or both F4BC_QUORUM_RPC_URL_1 and F4BC_QUORUM_RPC_URL_2',
+          )
+        }
+        const method = methodValue.toUpperCase()
+        if (method !== 'GET' && method !== 'POST') throw new Error('--method must be GET or POST')
+        if (bodyFile && method !== 'POST') throw new Error('--body-file requires --method POST')
+        if (contentType && method !== 'POST') throw new Error('--content-type requires --method POST')
+        const peer = new PeerPaymentClient(localIdentity, {
+          identityPath: identityFile,
+          rpcUrl,
+          quorumRpcUrls,
+          ...(chainId ? { chainIdOverride: chainId } : {}),
+          ...(deps.rpcFetch ? { rpcFetch: deps.rpcFetch } : {}),
+        })
+        const amountAtomic = positiveAtomicAmount(amountValue, '--amount-atomic')
+        const body = bodyFile
+          ? new Uint8Array(await boundedFile(
+              bodyFile,
+              MAX_PEER_REQUEST_BODY_BYTES,
+              'peer request body',
+              identityFile,
+              localIdentity,
+            ))
+          : undefined
+        result = await peer.clearTerminalPayment({
+          url: args[1],
+          method,
+          ...(body ? { body } : {}),
+          ...(contentType ? { contentType } : {}),
+          amountAtomic,
+          payTo,
+        }, guard!)
+        break
+      }
       exactArgs(args, operation === 'post' ? 2 : 3, usage)
       if (operation === 'post') {
         const job = await jsonFile(args[1], identityFile, localIdentity)
