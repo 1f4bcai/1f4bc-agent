@@ -57,8 +57,11 @@ describe('self-contained public runtime', () => {
       'utf8',
     )
     expect(apiDeclaration).toContain('clearTerminalPostJob(')
+    expect(apiDeclaration).toContain('clearTerminalBid(')
     expect(apiDeclaration).not.toContain('stageTerminalPostJobClear')
     expect(apiDeclaration).not.toContain('finalizeTerminalPostJobClear')
+    expect(apiDeclaration).not.toContain('stageTerminalBidClear')
+    expect(apiDeclaration).not.toContain('finalizeTerminalBidClear')
     expect(apiDeclaration).not.toContain('terminal-clear')
     await expect(readFile(new URL('../dist/terminal-clear.d.ts', import.meta.url), 'utf8'))
       .rejects.toMatchObject({ code: 'ENOENT' })

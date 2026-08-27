@@ -45,11 +45,11 @@ describe('published package contract', () => {
     const license = await readFile(new URL('../LICENSE', import.meta.url), 'utf8')
 
     expect(manifest.name).toBe('@1f4bcai/agent')
-    expect(manifest.version).toBe('0.1.3')
-    expect(rootManifest.version).toBe('0.1.3')
-    expect(lock.version).toBe('0.1.3')
-    expect(lock.packages?.['']?.version).toBe('0.1.3')
-    expect(lock.packages?.['packages/agent-cli']?.version).toBe('0.1.3')
+    expect(manifest.version).toBe('0.1.4')
+    expect(rootManifest.version).toBe('0.1.4')
+    expect(lock.version).toBe('0.1.4')
+    expect(lock.packages?.['']?.version).toBe('0.1.4')
+    expect(lock.packages?.['packages/agent-cli']?.version).toBe('0.1.4')
     expect(manifest.bin).toEqual({ '1f4bc': 'dist/index.js' })
     expect(manifest.private).not.toBe(true)
     expect(manifest.publishConfig).toEqual({
@@ -113,6 +113,7 @@ describe('published package contract', () => {
     expect(readme).toContain('agent-v0.1.0')
     expect(readme).toContain('agent-v0.1.2')
     expect(readme).toContain('agent-v0.1.3')
+    expect(readme).toContain('0.1.4')
     expect(readme).toContain('historical registry evidence')
     expect(readme).toContain('do not establish the replacement repository')
     expect(readme).toContain('One-time repository-history exception')
@@ -121,15 +122,31 @@ describe('published package contract', () => {
     expect(readme).toContain('snapshot-only')
     expect(readme).toContain('does not approve Git history or refs')
     expect(readme).toContain('repository_dispatch')
-    expect(readme).toContain('bootstrap-ci')
     expect(readme).toContain('RELEASE_APP_ACTOR')
     expect(readme).toContain('RELEASE_APP_ACTOR_ID')
+    expect(readme).toContain('RELEASE_APP_ID')
+    expect(readme).toContain('RELEASE_APP_PRIVATE_KEY')
     expect(readme).not.toContain('workflow_dispatch')
+    expect(readme).toContain('replacement bootstrap complete')
+    expect(readme).toContain('That transaction is complete')
+    expect(readme).toContain('privileged introduction workflow was retired')
+    expect(readme).toContain('private source audit archive')
+    expect(readme).toContain('must not be copied back into `.github/workflows`')
+    expect(readme).toContain('Replacement version `0.1.3` was bootstrapped')
+    expect(readme).not.toContain('replacement bootstrap in progress')
+    expect(readme).not.toContain('Before `0.1.4`, complete')
+    expect(readme).not.toContain('For replacement version `0.1.3`, bootstrap')
     expect(readme).toContain('zero required reviewers')
     expect(readme).not.toContain('one required reviewer')
     expect(readme).not.toContain('approval-gated')
     expect(readme).toContain('agent-candidate-*')
+    expect(readme).toContain('promote-agent-candidate')
+    expect(readme).toContain('lease-protected atomic Git push')
+    expect(readme).toContain('cannot authorize their own introduction')
     expect(readme).toContain('proposal snapshot checks')
+    expect(readme).toContain('GitHub-managed `refs/pull/<positive-id>/{head,merge}`')
+    expect(readme).toContain('only permitted operator-created source-bearing ref')
+    expect(readme).toContain('ignores only the exact GitHub-managed pull-ref shape')
     expect(readme).toContain('no-bypass update and deletion')
     expect(readme).toContain('authority pinned from canonical `main`')
     expect(license).toContain('Permission is hereby granted, free of charge')
@@ -148,6 +165,15 @@ describe('release workflow contract', () => {
         'utf8',
       ),
     ])
+    await expect(
+      readFile(
+        new URL(
+          '../../../.github/workflows/bootstrap-agent-cli-promotion-authority.yml',
+          import.meta.url,
+        ),
+        'utf8',
+      ),
+    ).rejects.toMatchObject({ code: 'ENOENT' })
 
     expect(workflow).toContain('environment: npm-agent-release')
     expect(workflow).toContain('1f4bcai/1f4bc-agent')

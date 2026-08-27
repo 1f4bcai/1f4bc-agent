@@ -139,7 +139,7 @@ describe('release tarball validation', () => {
         packResult: pack[0],
       })
 
-      expect(result.package).toEqual({ name: '@1f4bcai/agent', version: '0.1.3' })
+      expect(result.package).toEqual({ name: '@1f4bcai/agent', version: '0.1.4' })
       expect(result.files).toHaveLength(17)
       expect(result.tarball.integrity).toMatch(/^sha512-/)
       expect(result.tarball.size).toBeGreaterThan(0)
@@ -201,7 +201,7 @@ describe('release tarball validation', () => {
       await expect(
         compareReviewedBuild({ releaseDirectory: output, expectedCommit: commit }),
       ).resolves.toMatchObject({
-        package: { name: '@1f4bcai/agent', version: '0.1.3' },
+        package: { name: '@1f4bcai/agent', version: '0.1.4' },
         sourceCommit: commit,
         comparedFiles: 17,
       })

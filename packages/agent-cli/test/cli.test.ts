@@ -27,6 +27,7 @@ import {
 } from '@x402/extensions/payment-identifier'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { verifyMessage, verifyTypedData, type Address, type Hex } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import {
   AgentApi,
   CURRENT_ACCEPTABLE_USE_URL,
@@ -294,6 +295,27 @@ function postingPaymentRequired(): PaymentRequired {
   }
 }
 
+const SECP256K1_ORDER =
+  115792089237316195423570985008687907852837564279074904382605163141518161494337n
+
+function replaceSignatureParts(
+  signature: string,
+  transform: (parts: { r: bigint; s: bigint; v: number }) => {
+    r: bigint
+    s: bigint
+    v: number
+  },
+): `0x${string}` {
+  const raw = signature.slice(2)
+  const changed = transform({
+    r: BigInt(`0x${raw.slice(0, 64)}`),
+    s: BigInt(`0x${raw.slice(64, 128)}`),
+    v: Number.parseInt(raw.slice(128, 130), 16),
+  })
+  const word = (value: bigint) => value.toString(16).padStart(64, '0')
+  return `0x${word(changed.r)}${word(changed.s)}${changed.v.toString(16).padStart(2, '0')}`
+}
+
 function authorizationValidBefore(header: string): number {
   const decoded = decodePaymentSignatureHeader(header)
   const payload = decoded.payload as { authorization?: { validBefore?: unknown } }
@@ -301,28 +323,6 @@ function authorizationValidBefore(header: string): number {
     throw new Error('test payment header has no validBefore')
   }
   return Number(payload.authorization.validBefore)
-}
-
-function jobPaymentRecoveryMessage(
-  origin: string,
-  chainId: number,
-  paymentId: string,
-  bodyHash: string,
-  payer: string,
-  nonce: string,
-  validBefore: number,
-): string {
-  return [
-    '1f4bc-payment-recovery/1',
-    origin,
-    String(chainId),
-    'POST /jobs',
-    paymentId,
-    bodyHash,
-    payer.toLowerCase(),
-    nonce.toLowerCase(),
-    String(validBefore),
-  ].join('\n')
 }
 
 afterEach(async () => {
@@ -407,25 +407,6 @@ describe('agent identity', () => {
       'cli',
       '1',
       'I am authorized to bind the operator, agree to the Terms and Acceptable Use Policy, and acknowledge the Privacy Notice.',
-    ].join('\n'))
-    expect(jobPaymentRecoveryMessage(
-      'https://1f4bc.ai',
-      8453,
-      '1f4bc_abcdefghijklmnop',
-      'ab'.repeat(32),
-      '0x1111111111111111111111111111111111111111',
-      `0x${'CD'.repeat(32)}`,
-      1_787_486_400,
-    )).toBe([
-      '1f4bc-payment-recovery/1',
-      'https://1f4bc.ai',
-      '8453',
-      'POST /jobs',
-      '1f4bc_abcdefghijklmnop',
-      'ab'.repeat(32),
-      '0x1111111111111111111111111111111111111111',
-      `0x${'cd'.repeat(32)}`,
-      '1787486400',
     ].join('\n'))
     expect(attestationMessage('https://1f4bc.ai', 8453, 42, 'job-1')).toBe(
       '1f4bc-attest/1\nhttps://1f4bc.ai\n8453\n42\njob-1',
@@ -2570,6 +2551,126 @@ describe('agent identity', () => {
     expect(paidAttemptSent).toBe(false)
   })
 
+  it.each([
+    ['shorter timeout', (required: PaymentRequired) => {
+      required.accepts[0]!.maxTimeoutSeconds = 299
+    }],
+    ['additional accepted key', (required: PaymentRequired) => {
+      Object.assign(required.accepts[0]!, { unexpected: true })
+    }],
+    ['additional token-domain key', (required: PaymentRequired) => {
+      Object.assign(required.accepts[0]!.extra!, { assetTransferMethod: 'eip3009' })
+    }],
+  ] as const)(
+    'rejects a marketplace challenge the Worker would reject: %s',
+    async (_label, mutate) => {
+      const path = await temporaryIdentity()
+      await runCli(['--identity', path, '--url', 'https://1f4bc.ai', 'init'], {
+        env: {},
+        generateWalletPrivateKey: () => walletPrivateKey,
+        stdout: { write: () => undefined },
+      })
+      const identity = { ...(await loadIdentity(path)), handle: 'alice' }
+      const required = structuredClone(postingPaymentRequired())
+      mutate(required)
+      let paidAttemptSent = false
+      const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init)
+        if (request.headers.has('PAYMENT-SIGNATURE')) {
+          paidAttemptSent = true
+          return Response.json({ id: 'must-not-be-created' }, { status: 201 })
+        }
+        return new Response(null, {
+          status: 402,
+          headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(required) },
+        })
+      })
+      const api = new AgentApi(identity, {
+        identityPath: path,
+        fetch: fetcher as typeof fetch,
+      })
+
+      await expect(guardedPost(api, { title: 'strict challenge contract' }))
+        .rejects.toThrow(/challenge does not match the pinned payment policy/i)
+      expect(paidAttemptSent).toBe(false)
+    },
+  )
+
+  it('validates retained authorizations against the Worker exact-schema and ECDSA contract', async () => {
+    const path = await temporaryIdentity()
+    await runCli(['--identity', path, '--url', 'https://1f4bc.ai', 'init'], {
+      env: {},
+      generateWalletPrivateKey: () => walletPrivateKey,
+      stdout: { write: () => undefined },
+    })
+    const identity = { ...(await loadIdentity(path)), handle: 'alice' }
+    const job = { title: 'strict retained authorization contract' }
+    let retainedHeader = ''
+    const ambiguousFetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      const payment = request.headers.get('PAYMENT-SIGNATURE')
+      if (payment) {
+        retainedHeader = payment
+        throw new Error('ambiguous transport failure')
+      }
+      return new Response(null, {
+        status: 402,
+        headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(postingPaymentRequired()) },
+      })
+    })
+    await expect(guardedPost(new AgentApi(identity, {
+      identityPath: path,
+      fetch: ambiguousFetcher as typeof fetch,
+    }), job)).rejects.toThrow('ambiguous transport failure')
+
+    const directory = paymentAttemptDirectory(path, identity.publicKey)
+    const [attemptName] = (await readdir(directory)).filter((name) => name.endsWith('.json'))
+    const attemptPath = join(directory, attemptName!)
+    const originalAttempt = JSON.parse(await readFile(attemptPath, 'utf8')) as Record<string, unknown>
+    const originalPayload = decodePaymentSignatureHeader(retainedHeader)
+    const originalSignature = originalPayload.payload.signature as string
+    const mutations: Array<[string, (payload: ReturnType<typeof decodePaymentSignatureHeader>) => void]> = [
+      ['timeout', (payload) => { payload.accepted.maxTimeoutSeconds = 299 }],
+      ['accepted keys', (payload) => { Object.assign(payload.accepted, { unexpected: true }) }],
+      ['token-domain keys', (payload) => {
+        Object.assign(payload.accepted.extra, { assetTransferMethod: 'eip3009' })
+      }],
+      ['payload keys', (payload) => { Object.assign(payload.payload, { unexpected: true }) }],
+      ['authorization keys', (payload) => {
+        Object.assign(payload.payload.authorization as object, { unexpected: true })
+      }],
+      ['non-contract recovery byte', (payload) => {
+        payload.payload.signature = replaceSignatureParts(
+          originalSignature,
+          ({ r, s, v }) => ({ r, s, v: v - 27 }),
+        )
+      }],
+      ['high-s signature', (payload) => {
+        payload.payload.signature = replaceSignatureParts(
+          originalSignature,
+          ({ r, s, v }) => ({ r, s: SECP256K1_ORDER - s, v: v === 27 ? 28 : 27 }),
+        )
+      }],
+    ]
+
+    for (const [label, mutate] of mutations) {
+      const changed = structuredClone(originalPayload)
+      mutate(changed)
+      await writeFile(attemptPath, `${JSON.stringify({
+        ...originalAttempt,
+        headerValue: btoa(JSON.stringify(changed)),
+      })}\n`, { mode: 0o600 })
+      const network = vi.fn(async () => {
+        throw new Error('recovery network must not be reached')
+      })
+      await expect(new AgentApi(identity, {
+        identityPath: path,
+        fetch: network as typeof fetch,
+      }).recoverPostJob(job), label).rejects.toThrow(/pinned payment policy|invalid EIP-3009/i)
+      expect(network, label).not.toHaveBeenCalled()
+    }
+  })
+
   it('refuses to send a settle-crash token to mainnet, HTTP, or a non-staging host', async () => {
     const path = await temporaryIdentity()
     await runCli(['--identity', path, 'init'], {
@@ -3206,6 +3307,223 @@ describe('agent identity', () => {
     expect(retained).not.toHaveProperty('result')
   })
 
+  it('never clears a refreshed authorization even if its replacement looks expired and unused', async () => {
+    const path = await temporaryIdentity()
+    await runCli(['--identity', path, '--url', 'https://1f4bc.ai', 'init'], {
+      env: {},
+      generateWalletPrivateKey: () => walletPrivateKey,
+      stdout: { write: () => undefined },
+    })
+    await runCli(['--identity', path, 'register', 'alice', ...acceptCurrentTerms], {
+      env: {},
+      fetch: vi.fn(async () => Response.json({ handle: 'alice' }, { status: 201 })) as typeof fetch,
+      stdout: { write: () => undefined },
+    })
+    const identity = await loadIdentity(path)
+    const job = { title: 'old authorization may still be live' }
+    const jobFile = join(dirname(path), 'refreshed-recovery-job.json')
+    await writeFile(jobFile, JSON.stringify(job))
+    const retainedHeaders: string[] = []
+    await expect(runCli(['--identity', path, 'post', jobFile], {
+      env: {
+        F4BC_MAX_PAYMENT_ATOMIC: '10000',
+        F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '10000',
+      },
+      fetch: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init)
+        const payment = request.headers.get('PAYMENT-SIGNATURE')
+        if (payment) {
+          retainedHeaders.push(payment)
+          throw new Error('old authorization outcome is ambiguous')
+        }
+        return new Response(null, {
+          status: 402,
+          headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(postingPaymentRequired()) },
+        })
+      }) as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow('old authorization outcome is ambiguous')
+
+    const attemptDirectory = paymentAttemptDirectory(path, identity.publicKey)
+    const [attemptName] = (await readdir(attemptDirectory)).filter((name) => name.endsWith('.json'))
+    const attemptPath = join(attemptDirectory, attemptName!)
+    const stored = JSON.parse(await readFile(attemptPath, 'utf8')) as Record<string, unknown>
+    const oldHeader = retainedHeaders[0]!
+    const decoded = decodePaymentSignatureHeader(oldHeader)
+    const oldAuthorization = decoded.payload.authorization as {
+      from: `0x${string}`
+      to: `0x${string}`
+      value: string
+      validAfter: string
+      validBefore: string
+      nonce: `0x${string}`
+    }
+    const replacementAuthorization = {
+      ...oldAuthorization,
+      validBefore: '1',
+      nonce: `0x${'7a'.repeat(32)}`,
+    }
+    const replacementSignature = await privateKeyToAccount(walletPrivateKey as `0x${string}`)
+      .signTypedData({
+        domain: {
+          name: 'USD Coin',
+          version: '2',
+          chainId: 8453,
+          verifyingContract: decoded.accepted.asset as `0x${string}`,
+        },
+        types: authorizationTypes,
+        primaryType: 'TransferWithAuthorization',
+        message: {
+          from: replacementAuthorization.from as `0x${string}`,
+          to: replacementAuthorization.to as `0x${string}`,
+          value: BigInt(replacementAuthorization.value),
+          validAfter: BigInt(replacementAuthorization.validAfter),
+          validBefore: 1n,
+          nonce: replacementAuthorization.nonce as `0x${string}`,
+        },
+      })
+    const replacementHeader = btoa(JSON.stringify({
+      ...decoded,
+      payload: {
+        ...decoded.payload,
+        authorization: replacementAuthorization,
+        signature: replacementSignature,
+      },
+    }))
+    stored.headerValue = replacementHeader
+    stored.refreshCount = 1
+    await writeFile(attemptPath, `${JSON.stringify(stored)}\n`, { mode: 0o600 })
+    expect(Number(oldAuthorization.validBefore)).toBeGreaterThan(1)
+    expect(replacementHeader).not.toBe(oldHeader)
+
+    const identifier = decoded.extensions?.[PAYMENT_IDENTIFIER] as { info?: { id?: string } }
+    const paymentId = identifier.info!.id!
+    const bodyHash = sha256Hex(JSON.stringify(job))
+    let recoveryState: 'terminal' | 'committed' = 'terminal'
+    const recoveryFetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      expect(request.method).toBe('GET')
+      expect(request.headers.get('PAYMENT-SIGNATURE')).toBe(replacementHeader)
+      return Response.json({
+        operation: 'POST /jobs',
+        paymentId,
+        bodyHash,
+        state: recoveryState,
+        result: recoveryState === 'committed' ? { id: 'durably-committed-job' } : null,
+        ...(recoveryState === 'terminal' ? { terminalBasis: 'durable-attempt' } : {}),
+      })
+    })
+
+    await expect(runCli(['--identity', path, 'recover', 'post', jobFile], {
+      env: {},
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/refreshed payment authorization.*cannot be terminal/i)
+    await expect(runCli([
+      '--identity', path,
+      'recover', 'post', jobFile,
+      '--clear-terminal',
+    ], {
+      env: {
+        F4BC_MAX_PAYMENT_ATOMIC: '10000',
+        F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '10000',
+      },
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/refreshed payment authorization.*cannot be terminal/i)
+
+    const stillPending = JSON.parse(await readFile(attemptPath, 'utf8')) as {
+      state: string
+      refreshCount: number
+      headerValue: string
+    }
+    expect(stillPending).toMatchObject({
+      state: 'pending',
+      refreshCount: 1,
+      headerValue: replacementHeader,
+    })
+    const archiveDirectory = join(
+      dirname(path),
+      'payment-attempt-archive',
+      sha256Hex(identity.publicKey),
+    )
+    await expect(readdir(archiveDirectory)).rejects.toMatchObject({ code: 'ENOENT' })
+    const spendFiles = (await readdir(dirname(path)))
+      .filter((name) => /^spend-[0-9a-f]{64}\.json$/.test(name))
+    expect(spendFiles).toHaveLength(1)
+    const spend = JSON.parse(await readFile(join(dirname(path), spendFiles[0]!), 'utf8')) as {
+      entries: Array<{ state: string }>
+    }
+    expect(spend.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+
+    const locallyTerminal = {
+      ...stillPending,
+      ...stored,
+      state: 'terminal',
+      refreshCount: 1,
+      headerValue: replacementHeader,
+      terminalAt: Date.now(),
+      terminalProofVersion: 1,
+    }
+    await writeFile(attemptPath, `${JSON.stringify(locallyTerminal)}\n`, { mode: 0o600 })
+    for (const args of [
+      ['--identity', path, 'recover', 'post', jobFile],
+      ['--identity', path, 'recover', 'post', jobFile, '--clear-terminal'],
+    ]) {
+      await expect(runCli(args, {
+        env: args.includes('--clear-terminal') ? {
+          F4BC_MAX_PAYMENT_ATOMIC: '10000',
+          F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '10000',
+        } : {},
+        fetch: recoveryFetcher as typeof fetch,
+        stdout: { write: () => undefined },
+      })).rejects.toThrow(/refreshed payment authorization.*cannot be terminal/i)
+    }
+
+    const attemptKey = attemptName!.replace(/\.json$/, '')
+    const terminalContents = `${JSON.stringify(locallyTerminal)}\n`
+    await mkdir(archiveDirectory, { recursive: true, mode: 0o700 })
+    const archivePath = join(
+      archiveDirectory,
+      `${attemptKey}.${locallyTerminal.terminalAt}.${sha256Hex(terminalContents).slice(0, 16)}.json`,
+    )
+    await writeFile(archivePath, terminalContents, { mode: 0o600 })
+    await rm(attemptPath)
+    for (const args of [
+      ['--identity', path, 'recover', 'post', jobFile],
+      ['--identity', path, 'recover', 'post', jobFile, '--clear-terminal'],
+    ]) {
+      await expect(runCli(args, {
+        env: args.includes('--clear-terminal') ? {
+          F4BC_MAX_PAYMENT_ATOMIC: '10000',
+          F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '10000',
+        } : {},
+        fetch: recoveryFetcher as typeof fetch,
+        stdout: { write: () => undefined },
+      })).rejects.toThrow(/refreshed payment authorization.*cannot be terminal/i)
+    }
+    expect((JSON.parse(await readFile(archivePath, 'utf8')) as { refreshCount: number }).refreshCount)
+      .toBe(1)
+
+    await rm(archiveDirectory, { recursive: true })
+    await writeFile(attemptPath, `${JSON.stringify({
+      ...stored,
+      state: 'pending',
+      refreshCount: 1,
+      headerValue: replacementHeader,
+    })}\n`, { mode: 0o600 })
+
+    recoveryState = 'committed'
+    await expect(runCli(['--identity', path, 'recover', 'post', jobFile], {
+      env: {},
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: () => undefined },
+    })).resolves.toMatchObject({
+      state: 'committed',
+      result: { id: 'durably-committed-job' },
+    })
+  })
+
   it('recovers, tombstones, and explicitly archives one terminal post authorization', async () => {
     const path = await temporaryIdentity()
     await runCli(['--identity', path, '--url', 'https://1f4bc.ai', 'init'], {
@@ -3268,33 +3586,17 @@ describe('agent identity', () => {
       recoveryRequests.push(request)
       expect(request.method).toBe('GET')
       expect(request.headers.get('PAYMENT-SIGNATURE')).toBe(expectedRecoveryHeader)
-      const recoverySignature = request.headers.get('X-1F4BC-Recovery-Signature')
-      expect(recoverySignature).toMatch(/^0x[0-9a-f]{130}$/i)
+      expect(request.headers.has('X-1F4BC-Recovery-Signature')).toBe(false)
       const decoded = decodePaymentSignatureHeader(expectedRecoveryHeader)
       const authorization = decoded.payload.authorization as {
-        from: `0x${string}`
         nonce: string
-        validBefore: string
       }
       const identifier = decoded.extensions?.[PAYMENT_IDENTIFIER] as { info?: { id?: string } }
       const paymentId = identifier.info!.id!
       const bodyHash = new URL(request.url).searchParams.get('bodyHash')!
-      await expect(verifyMessage({
-        address: identity.wallet,
-        message: jobPaymentRecoveryMessage(
-          'https://1f4bc.ai',
-          8453,
-          paymentId,
-          bodyHash,
-          authorization.from,
-          authorization.nonce,
-          Number(authorization.validBefore),
-        ),
-        signature: recoverySignature as `0x${string}`,
-      })).resolves.toBe(true)
       if (typeof recoveryMode === 'number') {
         return new Response(
-          `${expectedRecoveryHeader} ${authorization.nonce} ${recoverySignature}`,
+          `${expectedRecoveryHeader} ${authorization.nonce}`,
           {
             status: recoveryMode,
             headers: recoveryMode === 409 || recoveryMode === 429 || recoveryMode === 503
@@ -3310,6 +3612,7 @@ describe('agent identity', () => {
         state: recoveryMode,
         result: null,
       }
+      if (recoveryMode === 'terminal') recovered.terminalBasis = 'durable-attempt'
       if (recoveryMode === 'committed') recovered.result = { id: 'recovered-job-id' }
       if (recoveryMode === 'wrong-operation') recovered.operation = 'POST /jobs/other'
       if (recoveryMode === 'wrong-payment-id') recovered.paymentId = `${paymentId}-other`
@@ -3385,9 +3688,7 @@ describe('agent identity', () => {
       expect(diagnostic).not.toContain(
         (decoded.payload.authorization as { nonce: string }).nonce,
       )
-      expect(diagnostic).not.toContain(
-        recoveryRequests.at(-1)!.headers.get('X-1F4BC-Recovery-Signature')!,
-      )
+      expect(recoveryRequests.at(-1)!.headers.has('X-1F4BC-Recovery-Signature')).toBe(false)
       await assertStillAmbiguousAndPending()
     }
 
@@ -3624,9 +3925,8 @@ describe('agent identity', () => {
     for (const output of [recoveryOutput, clearOutput]) {
       expect(output).not.toContain(paymentHeaders[0]!)
       expect(output).not.toContain(retainedNonce)
-      for (const request of recoveryRequests) {
-        expect(output).not.toContain(request.headers.get('X-1F4BC-Recovery-Signature')!)
-      }
+      expect(recoveryRequests.every((request) =>
+        !request.headers.has('X-1F4BC-Recovery-Signature'))).toBe(true)
     }
 
     await expect(runCli(['--identity', path, 'post', jobFile], {
@@ -3696,7 +3996,7 @@ describe('agent identity', () => {
   })
 
   it.each(['v1', 'v2'] as const)(
-    'archives and clears a terminal post retained under the legacy key (%s journal)',
+    'handles a terminal post retained under the legacy key safely (%s journal)',
     async (journalVersion) => {
       const path = await temporaryIdentity()
       await runCli(['--identity', path, '--url', 'https://1f4bc.ai', 'init'], {
@@ -3760,14 +4060,20 @@ describe('agent identity', () => {
           bodyHash: new URL(request.url).searchParams.get('bodyHash'),
           state: 'terminal',
           result: null,
+          terminalBasis: 'durable-attempt',
         })
       })
-      await expect(runCli(['--identity', path, 'recover', 'post', jobFile], {
+      const recovery = expect(runCli(['--identity', path, 'recover', 'post', jobFile], {
         env: {},
         fetch: recoveryFetch as typeof fetch,
         stdout: { write: () => undefined },
-      })).resolves.toMatchObject({ state: 'terminal', cleared: false })
-      await expect(runCli([
+      }))
+      if (journalVersion === 'v1') {
+        await recovery.rejects.toThrow(/legacy payment authorization cannot be terminal or cleared/i)
+      } else {
+        await recovery.resolves.toMatchObject({ state: 'terminal', cleared: false })
+      }
+      const clear = expect(runCli([
         '--identity', path,
         'recover', 'post', jobFile,
         '--clear-terminal',
@@ -3778,15 +4084,33 @@ describe('agent identity', () => {
         },
         fetch: recoveryFetch as typeof fetch,
         stdout: { write: () => undefined },
-      })).resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
-      expect((await readdir(directory)).filter((name) => name.endsWith('.json'))).toEqual([])
+      }))
+      if (journalVersion === 'v1') {
+        await clear.rejects.toThrow(/legacy payment authorization cannot be terminal or cleared/i)
+        expect((await readdir(directory)).filter((name) => name.endsWith('.json')))
+          .toEqual([`${legacyKey}.json`])
+      } else {
+        await clear.resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
+        expect((await readdir(directory)).filter((name) => name.endsWith('.json'))).toEqual([])
+      }
       const archiveDirectory = join(
         dirname(path),
         'payment-attempt-archive',
         sha256Hex(identity.publicKey),
       )
-      expect((await readdir(archiveDirectory)).filter((name) =>
-        name.startsWith(`${legacyKey}.`) && name.endsWith('.json'))).toHaveLength(1)
+      if (journalVersion === 'v1') {
+        await expect(readdir(archiveDirectory)).rejects.toMatchObject({ code: 'ENOENT' })
+        const spendFiles = (await readdir(dirname(path)))
+          .filter((name) => /^spend-[0-9a-f]{64}\.json$/.test(name))
+        const spend = JSON.parse(await readFile(
+          join(dirname(path), spendFiles[0]!),
+          'utf8',
+        )) as { entries: Array<{ state: string }> }
+        expect(spend.entries).toEqual([expect.objectContaining({ state: 'ambiguous' })])
+      } else {
+        expect((await readdir(archiveDirectory)).filter((name) =>
+          name.startsWith(`${legacyKey}.`) && name.endsWith('.json'))).toHaveLength(1)
+      }
     },
   )
 
@@ -3897,6 +4221,177 @@ describe('agent identity', () => {
 
     await expect(guardedPost(api, { title: 'do not overcharge' })).rejects.toThrow()
     expect(requests.some((request) => request.headers.has('PAYMENT-SIGNATURE'))).toBe(false)
+  })
+
+  it('recovers and explicitly clears only one exact terminal bid authorization', async () => {
+    const path = await temporaryIdentity()
+    await runCli(['--identity', path, '--url', 'https://1f4bc.ai', 'init'], {
+      env: {},
+      generateWalletPrivateKey: () => walletPrivateKey,
+      stdout: { write: () => undefined },
+    })
+    await runCli(['--identity', path, 'register', 'alice', ...acceptCurrentTerms], {
+      env: {},
+      fetch: vi.fn(async () => Response.json({ handle: 'alice' }, { status: 201 })) as typeof fetch,
+      stdout: { write: () => undefined },
+    })
+    const identity = await loadIdentity(path)
+    const jobId = 'job-terminal-bid'
+    const bid = { message: 'recover this exact bid', priceAtomic: '10000', etaHours: 2 }
+    const bidFile = join(dirname(path), 'recovery-bid.json')
+    await writeFile(bidFile, JSON.stringify(bid))
+    const required = postingPaymentRequired()
+    required.resource.url = `https://1f4bc.ai/jobs/${jobId}/bids`
+    required.resource.description = '1f4bc bid toll'
+    const paymentHeaders: string[] = []
+    const failedFetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      const requestUrl = new URL(request.url)
+      if (request.method === 'GET' && requestUrl.pathname === `/jobs/${jobId}`) {
+        return Response.json({ id: jobId, budgetAtomic: '1000000' })
+      }
+      const payment = request.headers.get('PAYMENT-SIGNATURE')
+      if (payment) {
+        paymentHeaders.push(payment)
+        throw new Error('ambiguous bid transport failure')
+      }
+      return new Response(null, {
+        status: 402,
+        headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(required) },
+      })
+    })
+    const caps = {
+      F4BC_MAX_PAYMENT_ATOMIC: '10000',
+      F4BC_DAILY_PAYMENT_LIMIT_ATOMIC: '10000',
+    }
+    await expect(runCli(['--identity', path, 'bid', jobId, bidFile], {
+      env: caps,
+      fetch: failedFetcher as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow('ambiguous bid transport failure')
+    expect(new Set(paymentHeaders)).toHaveLength(1)
+    const retainedPayment = paymentHeaders[0]!
+    const decoded = decodePaymentSignatureHeader(retainedPayment)
+    const authorization = decoded.payload.authorization as {
+      from: `0x${string}`
+      nonce: string
+      validBefore: string
+    }
+    const identifier = decoded.extensions?.[PAYMENT_IDENTIFIER] as { info?: { id?: string } }
+    const paymentId = identifier.info!.id!
+    const rawBody = JSON.stringify(bid)
+    const bodyHash = sha256Hex(rawBody)
+    const recoveryRequests: Request[] = []
+    const recoveryFetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      recoveryRequests.push(request)
+      const recoveryPath = `/payment-attempts/jobs/${jobId}/bids/${paymentId}` +
+        `?bodyHash=${bodyHash}`
+      await expectValidAgentEnvelope(request, identity, 'GET', recoveryPath, '')
+      expect(request.headers.get('PAYMENT-SIGNATURE')).toBe(retainedPayment)
+      expect(request.headers.has('X-1F4BC-Recovery-Signature')).toBe(false)
+      return Response.json({
+        operation: `POST /jobs/${jobId}/bids`,
+        paymentId,
+        bodyHash,
+        state: 'terminal',
+        result: null,
+        terminalBasis: 'durable-attempt',
+      })
+    })
+
+    const requestsBeforeMismatch = recoveryRequests.length
+    const changedBidFile = join(dirname(path), 'changed-recovery-bid.json')
+    await writeFile(changedBidFile, JSON.stringify({ ...bid, etaHours: 3 }))
+    await expect(runCli(['--identity', path, 'recover', 'bid', jobId, changedBidFile], {
+      env: {},
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/no retained payment authorization exists for this exact bid body/i)
+    await expect(runCli(['--identity', path, 'recover', 'bid', 'another-job', bidFile], {
+      env: {},
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/no retained payment authorization exists for this exact bid body/i)
+    expect(recoveryRequests).toHaveLength(requestsBeforeMismatch)
+
+    let recoveryOutput = ''
+    await expect(runCli(['--identity', path, 'recover', 'bid', jobId, bidFile], {
+      env: {},
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: (chunk) => (recoveryOutput += chunk) },
+    })).resolves.toEqual({
+      operation: `POST /jobs/${jobId}/bids`,
+      paymentId,
+      bodyHash,
+      state: 'terminal',
+      result: null,
+      cleared: false,
+      terminalBasis: 'durable-attempt',
+    })
+
+    const activeDirectory = paymentAttemptDirectory(path, identity.publicKey)
+    const [activeName] = (await readdir(activeDirectory)).filter((name) => name.endsWith('.json'))
+    const terminalAttempt = JSON.parse(await readFile(
+      join(activeDirectory, activeName!),
+      'utf8',
+    )) as { state: string; pathWithQuery: string; headerValue: string }
+    expect(terminalAttempt).toMatchObject({
+      state: 'terminal',
+      pathWithQuery: `/jobs/${jobId}/bids`,
+      headerValue: retainedPayment,
+    })
+
+    const forbiddenPaidRequests: Request[] = []
+    await expect(runCli(['--identity', path, 'bid', jobId, bidFile], {
+      env: caps,
+      fetch: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init)
+        if (request.method === 'GET' && new URL(request.url).pathname === `/jobs/${jobId}`) {
+          return Response.json({ id: jobId })
+        }
+        forbiddenPaidRequests.push(request)
+        throw new Error('terminal bid must not be retried')
+      }) as typeof fetch,
+      stdout: { write: () => undefined },
+    })).rejects.toThrow(/recover bid <jobId> <bid\.json> --clear-terminal/i)
+    expect(forbiddenPaidRequests).toEqual([])
+
+    let clearOutput = ''
+    await expect(runCli([
+      '--identity', path,
+      'recover', 'bid', jobId, bidFile,
+      '--clear-terminal',
+    ], {
+      env: caps,
+      fetch: recoveryFetcher as typeof fetch,
+      stdout: { write: (chunk) => (clearOutput += chunk) },
+    })).resolves.toEqual({ state: 'terminal', cleared: true, archived: true })
+    expect(recoveryRequests.every((request) => request.method === 'GET')).toBe(true)
+    expect((await readdir(activeDirectory)).filter((name) => name.endsWith('.json'))).toEqual([])
+    const archiveDirectory = join(
+      dirname(path),
+      'payment-attempt-archive',
+      sha256Hex(identity.publicKey),
+    )
+    expect((await readdir(archiveDirectory)).filter((name) => name.endsWith('.json')))
+      .toHaveLength(1)
+    const spendFiles = (await readdir(dirname(path)))
+      .filter((name) => /^spend-[0-9a-f]{64}\.json$/.test(name))
+    expect(spendFiles).toHaveLength(1)
+    const spend = JSON.parse(await readFile(join(dirname(path), spendFiles[0]!), 'utf8')) as {
+      entries: Array<{ tool: string; state: string }>
+    }
+    expect(spend.entries).toEqual([
+      expect.objectContaining({ tool: 'bid_job', state: 'released' }),
+    ])
+    const retainedNonce = authorization.nonce
+    for (const output of [recoveryOutput, clearOutput]) {
+      expect(output).not.toContain(retainedPayment)
+      expect(output).not.toContain(retainedNonce)
+      expect(recoveryRequests.every((request) =>
+        !request.headers.has('X-1F4BC-Recovery-Signature'))).toBe(true)
+    }
   })
 
   it('enforces the flat one-cent bid toll regardless of job budget', async () => {

@@ -89,6 +89,7 @@ Commands:
   profile set <profile.json>
   post <job.json> [--staging-settle-crash]
   recover post <job.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]
+  recover bid <jobId> <bid.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]
   bid <jobId> <bid.json>
   award <jobId> <bidId>
   msg <jobId> <bidId> <text>
@@ -698,19 +699,31 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     }
     case 'recover': {
       const clearTerminal = flag(args, '--clear-terminal')
-      const usage = 'recover post <job.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]'
-      if (args[0] !== 'post') throw new Error(`usage: 1f4bc ${usage}`)
+      const operation = args[0]
+      const usage = operation === 'bid'
+        ? 'recover bid <jobId> <bid.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]'
+        : 'recover post <job.json> [--clear-terminal --max-payment-atomic N --daily-payment-limit-atomic N]'
+      if (operation !== 'post' && operation !== 'bid') {
+        throw new Error(
+          'usage: 1f4bc recover post <job.json> | recover bid <jobId> <bid.json>',
+        )
+      }
       if (!clearTerminal && (args.includes('--max-payment-atomic') || args.includes('--daily-payment-limit-atomic'))) {
         throw new Error('payment caps are accepted only with --clear-terminal')
       }
       const guard = clearTerminal ? await spendGuard(api, identityFile, args, env) : undefined
-      exactArgs(args, 2, usage)
-      const job = await jsonFile(args[1], identityFile, localIdentity)
-      if (!clearTerminal) {
-        result = await api.recoverPostJob(job)
+      exactArgs(args, operation === 'post' ? 2 : 3, usage)
+      if (operation === 'post') {
+        const job = await jsonFile(args[1], identityFile, localIdentity)
+        result = clearTerminal
+          ? await api.clearTerminalPostJob(job, guard!)
+          : await api.recoverPostJob(job)
         break
       }
-      result = await api.clearTerminalPostJob(job, guard!)
+      const bid = await jsonFile(args[2], identityFile, localIdentity)
+      result = clearTerminal
+        ? await api.clearTerminalBid(args[1], bid, guard!)
+        : await api.recoverBid(args[1], bid)
       break
     }
     case 'bid': {

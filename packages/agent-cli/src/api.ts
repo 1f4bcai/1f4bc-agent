@@ -187,13 +187,29 @@ export type JobPaymentRecoveryResult = {
   result: { id: string } | null
   cleared: boolean
   archived?: boolean
+  terminalBasis?: 'durable-attempt'
 }
+
+export type BidPaymentRecoveryResult = {
+  operation: `POST /jobs/${string}/bids`
+  paymentId: string
+  bodyHash: string
+  state: 'pending' | 'settled' | 'committed' | 'terminal'
+  result: { id: string } | null
+  cleared: boolean
+  archived?: boolean
+  terminalBasis?: 'durable-attempt'
+}
+
+type PaidMarketplaceRecoveryResult = JobPaymentRecoveryResult | BidPaymentRecoveryResult
 
 export type TerminalPostClearResult = Readonly<{
   state: 'terminal'
   cleared: true
   archived: true
 }>
+
+export type TerminalBidClearResult = TerminalPostClearResult
 
 export const POST_FEE_ATOMIC = 10_000n
 export const BID_FEE_ATOMIC = 10_000n
@@ -304,25 +320,19 @@ function jobPaymentNonce(paymentId: string, bodyHash: string): Hex {
   return `0x${sha256Hex(`1f4bc:post-job:v1\n${paymentId}\n${bodyHash}`)}`
 }
 
-function jobPaymentRecoveryMessage(
-  origin: string,
-  chainId: string | number,
-  paymentId: string,
-  bodyHash: string,
-  payer: string,
-  nonce: string,
-  validBefore: number,
-): string {
-  return protocolMessage('1f4bc-payment-recovery/1', [
-    origin,
-    chainId,
-    'POST /jobs',
-    paymentId,
-    bodyHash,
-    payer.toLowerCase(),
-    nonce.toLowerCase(),
-    validBefore,
-  ])
+function recoverableJobId(jobId: string): string {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) {
+    throw new Error('job id is invalid for payment recovery')
+  }
+  return jobId
+}
+
+function bidRequestPath(jobId: string): string {
+  return `/jobs/${encodeURIComponent(recoverableJobId(jobId))}/bids`
+}
+
+function bidRecoveryOperation(jobId: string): `POST /jobs/${string}/bids` {
+  return `POST /jobs/${recoverableJobId(jobId)}/bids`
 }
 
 export function requestEnvelopeMessage(
@@ -1417,6 +1427,27 @@ type MarketplacePaymentPolicy = {
   domain: UsdcEip712Domain
 }
 
+const SECP256K1_N =
+  115792089237316195423570985008687907852837564279074904382605163141518161494337n
+const SECP256K1_HALF_N = SECP256K1_N / 2n
+
+function exactKeys(value: JsonRecord, expected: readonly string[]): boolean {
+  const keys = Object.keys(value)
+  return keys.length === expected.length && expected.every((key) => keys.includes(key))
+}
+
+/** Match the ECDSA encoding accepted by the USDC contract, not merely viem recovery. */
+function isCanonicalContractSignature(signature: string): boolean {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return false
+  const raw = signature.slice(2)
+  const r = BigInt(`0x${raw.slice(0, 64)}`)
+  const s = BigInt(`0x${raw.slice(64, 128)}`)
+  const v = Number.parseInt(raw.slice(128, 130), 16)
+  return r > 0n && r < SECP256K1_N &&
+    s > 0n && s <= SECP256K1_HALF_N &&
+    (v === 27 || v === 28)
+}
+
 function marketplacePaymentPolicy(
   target: URL,
   chainId: number,
@@ -1437,8 +1468,20 @@ function isExactMarketplaceRequirement(
   value: unknown,
   policy: MarketplacePaymentPolicy,
 ): boolean {
-  if (!isRecord(value) || !isRecord(value.extra)) return false
-  const transferMethod = value.extra.assetTransferMethod
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      'scheme',
+      'network',
+      'asset',
+      'amount',
+      'payTo',
+      'maxTimeoutSeconds',
+      'extra',
+    ]) ||
+    !isRecord(value.extra) ||
+    !exactKeys(value.extra, ['name', 'version'])
+  ) return false
   return value.scheme === 'exact' &&
     value.network === policy.network &&
     typeof value.asset === 'string' &&
@@ -1447,12 +1490,9 @@ function isExactMarketplaceRequirement(
     typeof value.payTo === 'string' &&
     isAddress(value.payTo) &&
     value.payTo.toLowerCase() === policy.payTo.toLowerCase() &&
-    Number.isSafeInteger(value.maxTimeoutSeconds) &&
-    (value.maxTimeoutSeconds as number) >= 1 &&
-    (value.maxTimeoutSeconds as number) <= 300 &&
+    value.maxTimeoutSeconds === 300 &&
     value.extra.name === policy.domain.name &&
-    value.extra.version === policy.domain.version &&
-    (transferMethod === undefined || transferMethod === 'eip3009')
+    value.extra.version === policy.domain.version
 }
 
 function validateMarketplaceChallenge(
@@ -1502,8 +1542,9 @@ async function validateMarketplacePaymentHeader(
   }
   const identifier = decoded.extensions?.[PAYMENT_IDENTIFIER]
   const resource = decoded.resource
-  const authorization = decoded.payload.authorization
-  const signature = decoded.payload.signature
+  const paymentPayload = decoded.payload
+  const authorization = paymentPayload.authorization
+  const signature = paymentPayload.signature
   if (
     decoded.x402Version !== 2 ||
     !resource ||
@@ -1512,7 +1553,10 @@ async function validateMarketplacePaymentHeader(
     !isRecord(identifier.info) ||
     identifier.info.id !== paymentId ||
     !isExactMarketplaceRequirement(decoded.accepted, policy) ||
+    !isRecord(paymentPayload) ||
+    !exactKeys(paymentPayload, ['authorization', 'signature']) ||
     !isRecord(authorization) ||
+    !exactKeys(authorization, ['from', 'to', 'value', 'validAfter', 'validBefore', 'nonce']) ||
     typeof authorization.from !== 'string' ||
     !isAddress(authorization.from) ||
     authorization.from.toLowerCase() !== payer.toLowerCase() ||
@@ -1522,23 +1566,26 @@ async function validateMarketplacePaymentHeader(
     authorization.value !== policy.amount ||
     authorization.validAfter !== '0' ||
     typeof authorization.validBefore !== 'string' ||
-    !/^[0-9]+$/.test(authorization.validBefore) ||
+    !/^[1-9][0-9]{0,15}$/.test(authorization.validBefore) ||
     typeof authorization.nonce !== 'string' ||
     !/^0x[0-9a-fA-F]{64}$/.test(authorization.nonce) ||
     typeof signature !== 'string' ||
-    !/^0x[0-9a-fA-F]{130}$/.test(signature)
+    !isCanonicalContractSignature(signature)
   ) {
     throw new Error('x402 payment authorization does not match the pinned payment policy')
   }
 
-  const validBefore = BigInt(authorization.validBefore)
-  if (validBefore <= 0n) {
+  const validBeforeNumber = Number(authorization.validBefore)
+  if (!Number.isSafeInteger(validBeforeNumber)) {
     throw new Error('x402 payment authorization has an invalid validity window')
   }
+  const validBefore = BigInt(validBeforeNumber)
   if (requireFresh) {
-    const nowSeconds = BigInt(Math.floor(nowMilliseconds / 1_000))
-    const maxTimeout = BigInt(decoded.accepted.maxTimeoutSeconds)
-    if (validBefore > nowSeconds + maxTimeout + 5n) {
+    const nowSeconds = Math.floor(nowMilliseconds / 1_000)
+    if (
+      validBeforeNumber < nowSeconds + 60 ||
+      validBeforeNumber > nowSeconds + 300
+    ) {
       throw new Error('x402 payment authorization exceeds the pinned validity window')
     }
   }
@@ -1952,6 +1999,7 @@ export class AgentApi {
     paymentId: string,
     policy: MarketplacePaymentPolicy,
     nonce: Hex,
+    validBefore: number,
   ) {
     const wallet = privateKeyToAccount(this.#identityValue.walletPrivateKey)
     return new x402Client()
@@ -1984,7 +2032,10 @@ export class AgentApi {
           ) {
             throw new Error('x402 client created an invalid EIP-3009 authorization')
           }
-          const authorization = { ...current, nonce }
+          if (!Number.isSafeInteger(validBefore) || validBefore <= 0) {
+            throw new Error('x402 client cannot construct a safe authorization deadline')
+          }
+          const authorization = { ...current, nonce, validBefore: String(validBefore) }
           const signature = await wallet.signTypedData({
             domain: {
               name: policy.domain.name,
@@ -1999,7 +2050,7 @@ export class AgentApi {
               to: current.to as Hex,
               value: BigInt(current.value),
               validAfter: BigInt(current.validAfter),
-              validBefore: BigInt(current.validBefore),
+              validBefore: BigInt(authorization.validBefore),
               nonce,
             },
           })
@@ -2215,9 +2266,12 @@ export class AgentApi {
             pending.expectedAmountAtomic === expectedAmountAtomic.toString()
           if (!matches) throw new Error('payment-attempt journal entry does not match this request')
           if (pending.version === 2 && pending.state === 'terminal') {
+            const recoveryCommand = pathWithQuery === '/jobs'
+              ? '1f4bc recover post <job.json> --clear-terminal'
+              : '1f4bc recover bid <jobId> <bid.json> --clear-terminal'
             throw paymentFailure(
               new Error(
-                'payment authorization is server-confirmed terminal; run 1f4bc recover post <job.json> --clear-terminal before retrying this exact post',
+                `payment authorization is server-confirmed terminal; run ${recoveryCommand} before retrying this exact paid operation`,
               ),
               true,
             )
@@ -2330,7 +2384,12 @@ export class AgentApi {
       }
       const paidFetch = wrapFetchWithPayment(
         capturePaymentFetch,
-        this.paymentClient(paymentId, policy, jobPaymentNonce(paymentId, sha256Hex(rawBody))),
+        this.paymentClient(
+          paymentId,
+          policy,
+          jobPaymentNonce(paymentId, sha256Hex(rawBody)),
+          Math.floor(this.#now() / 1_000) + 240,
+        ),
       )
       const initialRequest = () =>
         paidFetch(target, {
@@ -2590,8 +2649,15 @@ export class AgentApi {
     return this.paidRequest('/jobs', claimed.job, POST_FEE_ATOMIC, options)
   }
 
-  private async recoverPostJobLocked(rawBody: string): Promise<{
-    result: JobPaymentRecoveryResult
+  private async recoverPaidOperationLocked(config: {
+    operation: 'POST /jobs' | `POST /jobs/${string}/bids`
+    pathWithQuery: string
+    recoveryPath(paymentId: string, bodyHash: string): string
+    rawBody: string
+    expectedAmountAtomic: bigint
+    subject: 'job' | 'bid'
+  }): Promise<{
+    result: PaidMarketplaceRecoveryResult
     attemptKey: string
     attempt: PaymentAttempt
     archived: boolean
@@ -2605,19 +2671,27 @@ export class AgentApi {
         `identity is not registered; run 1f4bc register <handle> --accept-terms ${CURRENT_TERMS_VERSION}`,
       )
     }
+    const {
+      operation,
+      pathWithQuery,
+      recoveryPath,
+      rawBody,
+      expectedAmountAtomic,
+      subject,
+    } = config
     assertNoIdentitySecrets(rawBody, this.#identityValue, 'marketplace payment body')
     const publicKey = this.#identityValue.publicKey
     let attemptKey = paymentAttemptKey(
       this.#identityValue,
-      '/jobs',
+      pathWithQuery,
       rawBody,
-      POST_FEE_ATOMIC,
+      expectedAmountAtomic,
     )
     const legacyKey = legacyPaymentAttemptKey(
       this.#identityValue,
-      '/jobs',
+      pathWithQuery,
       rawBody,
-      POST_FEE_ATOMIC,
+      expectedAmountAtomic,
     )
     await assertNoUnnamespacedPaymentAttempts(this.#identityPath)
     const current = await loadPaymentAttempt(this.#identityPath, publicKey, attemptKey)
@@ -2649,7 +2723,9 @@ export class AgentApi {
         archived = true
       }
     }
-    if (!attempt) throw new Error('no retained payment authorization exists for this exact job body')
+    if (!attempt) {
+      throw new Error(`no retained payment authorization exists for this exact ${subject} body`)
+    }
     const bodyHash = sha256Hex(rawBody)
     const matches =
       (attempt.version === 1 || (
@@ -2659,20 +2735,25 @@ export class AgentApi {
       attempt.baseUrl === this.#identityValue.baseUrl &&
       attempt.chainId === this.#identityValue.chainId &&
       attempt.wallet.toLowerCase() === this.#identityValue.wallet.toLowerCase() &&
-      attempt.pathWithQuery === '/jobs' &&
+      attempt.pathWithQuery === pathWithQuery &&
       attempt.bodyHash === bodyHash &&
-      attempt.expectedAmountAtomic === POST_FEE_ATOMIC.toString() &&
+      attempt.expectedAmountAtomic === expectedAmountAtomic.toString() &&
       paymentAttemptKeyFor({
         ...attempt,
         publicKey,
         handle,
         refreshCount: attempt.version === 1 ? 0 : attempt.refreshCount,
-      }) === paymentAttemptKey(this.#identityValue, '/jobs', rawBody, POST_FEE_ATOMIC)
+      }) === paymentAttemptKey(
+        this.#identityValue,
+        pathWithQuery,
+        rawBody,
+        expectedAmountAtomic,
+      )
     if (!matches) throw new Error('payment-attempt journal entry does not match this recovery')
     if (attempt.version === 2 && attempt.state === 'settled') {
       return {
         result: {
-          operation: 'POST /jobs',
+          operation,
           paymentId: attempt.paymentId,
           bodyHash,
           state: 'committed',
@@ -2686,9 +2767,13 @@ export class AgentApi {
       }
     }
 
-    const target = this.url('/jobs')
+    const target = this.url(pathWithQuery)
     assertOfficialPaidMarketplace(target, this.#identityValue.chainId)
-    const policy = marketplacePaymentPolicy(target, this.#identityValue.chainId, POST_FEE_ATOMIC)
+    const policy = marketplacePaymentPolicy(
+      target,
+      this.#identityValue.chainId,
+      expectedAmountAtomic,
+    )
     const payer = privateKeyToAccount(this.#identityValue.walletPrivateKey).address
     await validateMarketplacePaymentHeader(
       attempt.headerValue,
@@ -2698,61 +2783,47 @@ export class AgentApi {
       false,
       this.#now(),
     )
-    const decoded = decodePaymentSignatureHeader(attempt.headerValue)
-    const authorization = decoded.payload.authorization
-    if (
-      !isRecord(authorization) ||
-      typeof authorization.from !== 'string' ||
-      typeof authorization.nonce !== 'string' ||
-      typeof authorization.validBefore !== 'string' ||
-      !/^[1-9][0-9]{0,15}$/.test(authorization.validBefore)
-    ) {
-      throw new Error('retained payment authorization is invalid')
-    }
-    const validBefore = Number(authorization.validBefore)
-    if (!Number.isSafeInteger(validBefore)) {
-      throw new Error('retained payment authorization is invalid')
-    }
-    const recoveryPath = `/payment-attempts/jobs/${encodeURIComponent(attempt.paymentId)}` +
-      `?bodyHash=${encodeURIComponent(bodyHash)}`
+    const exactRecoveryPath = recoveryPath(attempt.paymentId, bodyHash)
     const headers = await signEnvelope(
       this.#identityValue,
       'GET',
-      recoveryPath,
+      exactRecoveryPath,
       '',
       this.nextTimestamp(),
     )
     headers.set('Accept', 'application/json')
     headers.set('PAYMENT-SIGNATURE', attempt.headerValue)
-    headers.set('X-1F4BC-Recovery-Signature', await privateKeyToAccount(
-      this.#identityValue.walletPrivateKey,
-    ).signMessage({
-      message: jobPaymentRecoveryMessage(
-        target.origin,
-        this.#identityValue.chainId,
-        attempt.paymentId,
-        bodyHash,
-        authorization.from,
-        authorization.nonce,
-        validBefore,
-      ),
-    }))
     const response = await marketplaceFetch(
       this.#fetcher,
-      this.url(recoveryPath),
+      this.url(exactRecoveryPath),
       { method: 'GET', headers },
     )
     const recovered = await readResponse(response)
     if (
       !isRecord(recovered) ||
-      recovered.operation !== 'POST /jobs' ||
+      recovered.operation !== operation ||
       recovered.paymentId !== attempt.paymentId ||
       recovered.bodyHash !== bodyHash ||
       !['pending', 'settled', 'committed', 'terminal'].includes(String(recovered.state))
     ) {
       throw new Error('payment recovery returned a conflicting result')
     }
-    const state = recovered.state as JobPaymentRecoveryResult['state']
+    const state = recovered.state as PaidMarketplaceRecoveryResult['state']
+    if (state === 'terminal') {
+      if (recovered.terminalBasis !== 'durable-attempt') {
+        throw new Error('payment recovery returned terminal without durable server provenance')
+      }
+      if (attempt.version === 1) {
+        throw new Error(
+          'legacy payment authorization cannot be terminal or cleared; only an exact committed result is recoverable',
+        )
+      }
+      if (attempt.refreshCount > 0) {
+        throw new Error(
+          'refreshed payment authorization cannot be terminal or cleared; an earlier authorization may still settle',
+        )
+      }
+    }
     if (attempt.version === 2 && attempt.state === 'terminal' && state !== 'terminal') {
       throw new Error('payment recovery contradicted a terminal local payment record')
     }
@@ -2777,7 +2848,7 @@ export class AgentApi {
       )
       return {
         result: {
-          operation: 'POST /jobs',
+          operation,
           paymentId: attempt.paymentId,
           bodyHash,
           state,
@@ -2806,12 +2877,13 @@ export class AgentApi {
     }
     return {
       result: {
-        operation: 'POST /jobs',
+        operation,
         paymentId: attempt.paymentId,
         bodyHash,
         state,
         result: null,
         cleared: archived,
+        ...(state === 'terminal' ? { terminalBasis: 'durable-attempt' as const } : {}),
         ...(archived ? { archived: true } : {}),
       },
       attemptKey,
@@ -2829,7 +2901,16 @@ export class AgentApi {
       paymentPrincipalLockFile(this.#identityPath, this.#identityValue.publicKey),
       async () => {
         await assertPaymentPrincipalReady(this.#identityPath!, this.#identityValue)
-        return (await this.recoverPostJobLocked(rawBody)).result
+        return (await this.recoverPaidOperationLocked({
+          operation: 'POST /jobs',
+          pathWithQuery: '/jobs',
+          recoveryPath: (paymentId, bodyHash) =>
+            `/payment-attempts/jobs/${encodeURIComponent(paymentId)}` +
+            `?bodyHash=${encodeURIComponent(bodyHash)}`,
+          rawBody,
+          expectedAmountAtomic: POST_FEE_ATOMIC,
+          subject: 'job',
+        })).result as JobPaymentRecoveryResult
       },
     )
   }
@@ -2854,7 +2935,16 @@ export class AgentApi {
       paymentPrincipalLockFile(this.#identityPath, this.#identityValue.publicKey),
       async () => {
         await assertPaymentPrincipalReady(this.#identityPath!, this.#identityValue)
-        const recovered = await this.recoverPostJobLocked(rawBody)
+        const recovered = await this.recoverPaidOperationLocked({
+          operation: 'POST /jobs',
+          pathWithQuery: '/jobs',
+          recoveryPath: (paymentId, bodyHash) =>
+            `/payment-attempts/jobs/${encodeURIComponent(paymentId)}` +
+            `?bodyHash=${encodeURIComponent(bodyHash)}`,
+          rawBody,
+          expectedAmountAtomic: POST_FEE_ATOMIC,
+          subject: 'job',
+        })
         if (recovered.result.state !== 'terminal') {
           throw paymentFailure(
             new Error('payment authorization is not server-confirmed terminal'),
@@ -2970,6 +3060,190 @@ export class AgentApi {
     } catch (error) {
       if (!(error instanceof TerminalPaymentCleared)) throw error
       await this.finalizeTerminalPostJobClear(job, error)
+      return error.result
+    }
+  }
+
+  async recoverBid(jobId: string, bid: unknown): Promise<BidPaymentRecoveryResult> {
+    if (!this.#identityPath) {
+      throw new Error('bid payment recovery requires a durable payment-recovery journal')
+    }
+    const operation = bidRecoveryOperation(jobId)
+    const pathWithQuery = bidRequestPath(jobId)
+    const rawBody = JSON.stringify(bid)
+    return withFileLock(
+      paymentPrincipalLockFile(this.#identityPath, this.#identityValue.publicKey),
+      async () => {
+        await assertPaymentPrincipalReady(this.#identityPath!, this.#identityValue)
+        return (await this.recoverPaidOperationLocked({
+          operation,
+          pathWithQuery,
+          recoveryPath: (paymentId, bodyHash) =>
+            `/payment-attempts/jobs/${encodeURIComponent(jobId)}` +
+            `/bids/${encodeURIComponent(paymentId)}` +
+            `?bodyHash=${encodeURIComponent(bodyHash)}`,
+          rawBody,
+          expectedAmountAtomic: BID_FEE_ATOMIC,
+          subject: 'bid',
+        })).result as BidPaymentRecoveryResult
+      },
+    )
+  }
+
+  /** @internal Two-phase capability boundary; use clearTerminalBid(). */
+  async stageTerminalBidClear(
+    jobId: string,
+    bid: unknown,
+    control: SpendControl,
+  ): Promise<never> {
+    const claimed = claimAuthorizedPaymentControl(
+      control,
+      'bid_job',
+      { jobId, bid },
+      BID_FEE_ATOMIC,
+      spendPolicyScope(this.#identityValue.chainId, this.#identityValue.wallet),
+    )
+    if (!this.#identityPath) {
+      throw paymentFailure(
+        new Error('bid payment recovery requires a durable payment-recovery journal'),
+        true,
+      )
+    }
+    const operation = bidRecoveryOperation(claimed.jobId)
+    const pathWithQuery = bidRequestPath(claimed.jobId)
+    const rawBody = JSON.stringify(claimed.bid)
+    return withFileLock(
+      paymentPrincipalLockFile(this.#identityPath, this.#identityValue.publicKey),
+      async () => {
+        await assertPaymentPrincipalReady(this.#identityPath!, this.#identityValue)
+        const recovered = await this.recoverPaidOperationLocked({
+          operation,
+          pathWithQuery,
+          recoveryPath: (paymentId, bodyHash) =>
+            `/payment-attempts/jobs/${encodeURIComponent(claimed.jobId)}` +
+            `/bids/${encodeURIComponent(paymentId)}` +
+            `?bodyHash=${encodeURIComponent(bodyHash)}`,
+          rawBody,
+          expectedAmountAtomic: BID_FEE_ATOMIC,
+          subject: 'bid',
+        })
+        if (recovered.result.state !== 'terminal') {
+          throw paymentFailure(
+            new Error('payment authorization is not server-confirmed terminal'),
+            true,
+          )
+        }
+        if (!recovered.archived) {
+          await stageTerminalPaymentArchive(
+            this.#identityPath!,
+            this.#identityValue.publicKey,
+            recovered.attemptKey,
+            {
+              paymentId: recovered.attempt.paymentId,
+              headerName: recovered.attempt.headerName,
+              headerValue: recovered.attempt.headerValue,
+            },
+          )
+        }
+        throw terminalPaymentCleared({
+          publicKey: this.#identityValue.publicKey,
+          attemptKey: recovered.attemptKey,
+          paymentId: recovered.attempt.paymentId,
+          bodyHash: recovered.result.bodyHash,
+        })
+      },
+    )
+  }
+
+  /** @internal Two-phase capability boundary; use clearTerminalBid(). */
+  async finalizeTerminalBidClear(
+    jobId: string,
+    bid: unknown,
+    completion: TerminalPaymentCleared,
+  ): Promise<void> {
+    if (!this.#identityPath) {
+      throw new Error('bid payment recovery requires a durable payment-recovery journal')
+    }
+    const pathWithQuery = bidRequestPath(jobId)
+    const rawBody = JSON.stringify(bid)
+    await withFileLock(
+      paymentPrincipalLockFile(this.#identityPath, this.#identityValue.publicKey),
+      async () => {
+        await assertPaymentPrincipalReady(this.#identityPath!, this.#identityValue)
+        const currentKey = paymentAttemptKey(
+          this.#identityValue,
+          pathWithQuery,
+          rawBody,
+          BID_FEE_ATOMIC,
+        )
+        const legacyKey = legacyPaymentAttemptKey(
+          this.#identityValue,
+          pathWithQuery,
+          rawBody,
+          BID_FEE_ATOMIC,
+        )
+        const binding = consumeTerminalPaymentClear(completion, {
+          publicKey: this.#identityValue.publicKey,
+          bodyHash: sha256Hex(rawBody),
+          attemptKeys: currentKey === legacyKey ? [currentKey] : [currentKey, legacyKey],
+        })
+        const attempt = await loadPaymentAttempt(
+          this.#identityPath!,
+          this.#identityValue.publicKey,
+          binding.attemptKey,
+        )
+        const archived = await loadArchivedTerminalPaymentAttempt(
+          this.#identityPath!,
+          this.#identityValue.publicKey,
+          binding.attemptKey,
+        )
+        const exact = attempt ?? archived
+        if (
+          !exact ||
+          exact.version !== 2 ||
+          exact.state !== 'terminal' ||
+          exact.paymentId !== binding.paymentId
+        ) {
+          throw new Error('server-confirmed terminal payment attempt is missing')
+        }
+        await finalizeTerminalPaymentArchive(
+          this.#identityPath!,
+          this.#identityValue.publicKey,
+          binding.attemptKey,
+          {
+            paymentId: exact.paymentId,
+            headerName: exact.headerName,
+            headerValue: exact.headerValue,
+          },
+        )
+      },
+    )
+  }
+
+  /**
+   * Explicitly clear one exact, server-confirmed terminal bid authorization.
+   * Recovery is read-only; the spend guard releases its reservation before
+   * the active terminal journal is finalized into the archive.
+   */
+  async clearTerminalBid(
+    jobId: string,
+    bid: unknown,
+    guard: McpSpendGuard,
+  ): Promise<TerminalBidClearResult> {
+    if (!(guard instanceof McpSpendGuard)) {
+      throw new Error('terminal payment clear requires the official spend-policy guard')
+    }
+    try {
+      await guard.execute(
+        'bid_job',
+        { jobId, bid },
+        BID_FEE_ATOMIC,
+        (control) => this.stageTerminalBidClear(jobId, bid, control),
+      )
+      throw new Error('terminal payment clear returned unexpectedly')
+    } catch (error) {
+      if (!(error instanceof TerminalPaymentCleared)) throw error
+      await this.finalizeTerminalBidClear(jobId, bid, error)
       return error.result
     }
   }

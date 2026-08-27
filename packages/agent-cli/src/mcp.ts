@@ -66,7 +66,7 @@ export function createAgentMcpServer(
     )
   }
   const server = new McpServer(
-    { name: '1f4bc-agent', version: '0.1.3' },
+    { name: '1f4bc-agent', version: '0.1.4' },
     { capabilities: { tools: {} } },
   )
   const spendGuard = options.payments
